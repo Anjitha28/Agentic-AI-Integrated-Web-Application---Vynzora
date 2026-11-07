@@ -619,8 +619,10 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
+    agent_name = os.getenv("LIVEKIT_AGENT_NAME", "vynzora-voice-agent")
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            agent_name=agent_name,
         )
     )
