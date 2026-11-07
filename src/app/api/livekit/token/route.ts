@@ -7,6 +7,7 @@ export async function GET(request: Request) {
     const room = searchParams.get('room') || 'vynzora-business-room';
     const identity = searchParams.get('identity') || `admin-${Date.now().toString(36)}`;
     const name = searchParams.get('name') || 'Vynzora Administrator';
+    const lang = searchParams.get('lang') || 'ml';
 
     const apiKey = process.env.LIVEKIT_API_KEY;
     const apiSecret = process.env.LIVEKIT_API_SECRET;
@@ -25,6 +26,7 @@ export async function GET(request: Request) {
     const at = new AccessToken(apiKey, apiSecret, {
       identity,
       name,
+      metadata: JSON.stringify({ language: lang }),
       ttl: '1h',
     });
 

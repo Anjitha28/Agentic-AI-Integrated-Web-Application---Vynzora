@@ -67,7 +67,7 @@ export default function VynzoraFloatingAssistant() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [continuousVoice, setContinuousVoice] = useState(false);
   const [autoVoiceEnabled, setAutoVoiceEnabled] = useState(true);
-  const [selectedLanguage, setSelectedLanguage] = useState<SupportedLanguage>('en');
+  const [selectedLanguage, setSelectedLanguage] = useState<SupportedLanguage>('ml');
   const [voiceError, setVoiceError] = useState<string | null>(null);
 
   // LiveKit WebRTC Voice Agent Connection State
@@ -76,6 +76,19 @@ export default function VynzoraFloatingAssistant() {
   const [agentSpeaking, setAgentSpeaking] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
   const [livekitError, setLivekitError] = useState<string | null>(null);
+
+  // STT Live Diagnostics State
+  const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [sttDebug, setSttDebug] = useState({
+    audioReceived: false,
+    sttProvider: 'Sarvam AI',
+    sttModel: 'saaras:v4',
+    configuredLanguage: 'ml-IN',
+    detectedLanguage: 'ml',
+    transcriptionMode: 'transcribe',
+    liveTranscript: '',
+    responseLanguage: 'ml-IN',
+  });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -190,8 +203,8 @@ export default function VynzoraFloatingAssistant() {
       stopSpeaking();
       stopListening();
 
-      // 1. Generate connection token from server-side route
-      const res = await fetch('/api/livekit/token?room=vynzora-crm-voice');
+      // 1. Generate connection token from server-side route with selected language
+      const res = await fetch(`/api/livekit/token?room=vynzora-crm-voice&lang=${selectedLanguage}`);
       const data = await res.json();
 
       if (!res.ok || !data.success || !data.token) {
@@ -226,6 +239,46 @@ export default function VynzoraFloatingAssistant() {
         setAgentSpeaking(isAgent);
       });
 
+      // Listen for STT Diagnostics & live transcribed Malayalam text from worker
+      room.on(RoomEvent.DataReceived, (payload: Uint8Array) => {
+        try {
+          const text = new TextDecoder().decode(payload);
+          const parsed = JSON.parse(text);
+          if (parsed.type === 'stt_debug') {
+            setSttDebug({
+              audioReceived: Boolean(parsed.audio_received),
+              sttProvider: parsed.stt_provider || 'Sarvam AI',
+              sttModel: parsed.stt_model || 'saaras:v4',
+              configuredLanguage: parsed.configured_language || 'ml-IN',
+              detectedLanguage: parsed.detected_language || 'ml',
+              transcriptionMode: parsed.mode || 'transcribe',
+              liveTranscript: parsed.live_transcript || '',
+              responseLanguage: parsed.response_language || 'ml-IN',
+            });
+            if (parsed.is_final && parsed.live_transcript) {
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'user' && last.content === parsed.live_transcript) {
+                  return prev;
+                }
+                return [
+                  ...prev,
+                  {
+                    id: `lk-user-${Date.now()}`,
+                    role: 'user',
+                    content: parsed.live_transcript,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                    language: selectedLanguage,
+                  },
+                ];
+              });
+            }
+          }
+        } catch {
+          // ignore non-json messages
+        }
+      });
+
       room.on(RoomEvent.Disconnected, () => {
         setLivekitConnected(false);
         setLivekitConnecting(false);
@@ -235,13 +288,24 @@ export default function VynzoraFloatingAssistant() {
       // 4. Connect to LiveKit Cloud
       await room.connect(data.wsUrl, data.token);
 
-      // 5. Publish microphone audio track
-      await room.localParticipant.setMicrophoneEnabled(true);
+      // 5. Publish microphone audio track with echo cancellation and 16kHz
+      await room.localParticipant.setMicrophoneEnabled(true, {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 16000,
+      });
 
       roomRef.current = room;
       setLivekitConnected(true);
       setLivekitConnecting(false);
       setMicMuted(false);
+      setSttDebug((prev) => ({
+        ...prev,
+        audioReceived: true,
+        configuredLanguage: selectedLanguage === 'ml' ? 'ml-IN' : selectedLanguage === 'hi' ? 'hi-IN' : 'en-IN',
+        detectedLanguage: selectedLanguage,
+      }));
 
       // Welcome message in chat indicating voice agent room joined
       setMessages((prev) => [
@@ -249,7 +313,7 @@ export default function VynzoraFloatingAssistant() {
         {
           id: `lk-sys-${Date.now()}`,
           role: 'assistant',
-          content: '🎙️ Connected to LiveKit Voice Agent. Microphone is live — speak in Malayalam, Hindi, or English.',
+          content: '🎙️ Connected to LiveKit Voice Agent (Sarvam Saaras v4). Microphone is live — speak in Malayalam, Hindi, or English.',
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           language: selectedLanguage,
         },
@@ -259,6 +323,34 @@ export default function VynzoraFloatingAssistant() {
       setLivekitError(err.message || 'Could not connect to LiveKit Voice Room');
       setLivekitConnected(false);
       setLivekitConnecting(false);
+    }
+  };
+
+  const handleLanguageChange = async (langCode: SupportedLanguage) => {
+    setSelectedLanguage(langCode);
+    const targetCode = langCode === 'ml' ? 'ml-IN' : langCode === 'hi' ? 'hi-IN' : 'en-IN';
+    setSttDebug((prev) => ({
+      ...prev,
+      configuredLanguage: targetCode,
+      detectedLanguage: langCode,
+      responseLanguage: targetCode,
+    }));
+
+    if (roomRef.current && roomRef.current.localParticipant) {
+      try {
+        const payload = JSON.stringify({
+          type: 'set_language',
+          language: targetCode,
+        });
+        const encoder = new TextEncoder();
+        await roomRef.current.localParticipant.publishData(encoder.encode(payload), {
+          reliable: true,
+          topic: 'stt_config',
+        });
+        await roomRef.current.localParticipant.setMetadata(JSON.stringify({ language: langCode }));
+      } catch (err) {
+        console.warn('Could not publish language change to LiveKit room:', err);
+      }
     }
   };
 
@@ -602,7 +694,7 @@ export default function VynzoraFloatingAssistant() {
                         <button
                           key={langCode}
                           type="button"
-                          onClick={() => setSelectedLanguage(langCode)}
+                          onClick={() => handleLanguageChange(langCode)}
                           className={`px-2 py-0.5 rounded font-semibold transition-all cursor-pointer ${
                             isSelected
                               ? 'bg-brand-600 text-white shadow-sm ring-1 ring-white/30'
@@ -638,6 +730,77 @@ export default function VynzoraFloatingAssistant() {
                     <span>Sarvam TTS</span>
                   </label>
                 </div>
+              </div>
+
+              {/* Live STT Diagnostics Bar & Collapsible Drawer */}
+              <div className="border-b border-slate-800/80 bg-slate-950/70 text-[10px]">
+                <div className="px-4 py-1.5 flex items-center justify-between">
+                  <div className="flex items-center gap-1.5 text-slate-300">
+                    <Sparkles className="w-3 h-3 text-brand-400" />
+                    <span className="font-semibold tracking-wide uppercase text-[9px] text-slate-400">STT Engine:</span>
+                    <span className="font-mono text-emerald-400 font-medium">Sarvam Saaras v4</span>
+                    <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-mono text-[9px] border border-slate-700">
+                      {sttDebug.configuredLanguage}
+                    </span>
+                    <span className="px-1 py-0.2 rounded bg-emerald-950/60 text-emerald-300 font-mono text-[9px] border border-emerald-800/60">
+                      transcribe
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setShowDebugPanel(!showDebugPanel)}
+                    className="text-[10px] text-brand-400 hover:text-brand-300 underline font-medium cursor-pointer"
+                  >
+                    {showDebugPanel ? 'Hide Diagnostics' : 'STT Diagnostics'}
+                  </button>
+                </div>
+
+                {showDebugPanel && (
+                  <div className="px-4 py-2 bg-slate-900/95 border-t border-slate-800 space-y-1.5 font-mono text-[10px]">
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-slate-300">
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">Audio Received:</span>
+                        <span className={`font-semibold ${livekitConnected ? 'text-emerald-400' : 'text-slate-500'}`}>
+                          {livekitConnected ? (agentSpeaking ? 'Yes (Agent Speaking)' : 'Yes (Mic Live)') : 'No'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">STT Provider:</span>
+                        <span className="text-brand-300 font-semibold">{sttDebug.sttProvider}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">STT Model:</span>
+                        <span className="text-indigo-300 font-semibold">{sttDebug.sttModel}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">Configured Language:</span>
+                        <span className="text-emerald-300 font-semibold">{sttDebug.configuredLanguage}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">Detected Language:</span>
+                        <span className="text-amber-300 font-semibold">{sttDebug.detectedLanguage}</span>
+                      </div>
+                      <div className="flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">Transcription Mode:</span>
+                        <span className="text-emerald-300 font-semibold">{sttDebug.transcriptionMode}</span>
+                      </div>
+                      <div className="col-span-2 flex items-center justify-between py-0.5 border-b border-slate-800/60">
+                        <span className="text-slate-400">Final Response Language:</span>
+                        <span className="text-teal-300 font-semibold">{sttDebug.responseLanguage}</span>
+                      </div>
+                    </div>
+
+                    <div className="pt-1">
+                      <span className="text-slate-400 block text-[9px] mb-0.5 uppercase tracking-wide">Live Transcribed Speech (Raw Script):</span>
+                      <div className="p-2 rounded bg-slate-950 border border-slate-800 text-slate-100 min-h-[32px] break-words">
+                        {sttDebug.liveTranscript ? (
+                          <span className="text-emerald-300">{sttDebug.liveTranscript}</span>
+                        ) : (
+                          <span className="text-slate-500 italic">Waiting for microphone speech...</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Error banner */}

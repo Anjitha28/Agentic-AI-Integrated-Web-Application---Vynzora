@@ -465,8 +465,8 @@ DATABASE & REASONING RULES:
 
 class VoiceAssistant:
     """
-    Multilingual Voice Assistant coordinating VAD, Sarvam Saaras v4 STT,
-    OpenAI LLM reasoning, and Sarvam Bulbul v3 TTS.
+    Multilingual Voice Assistant coordinating tuned Silero VAD, Sarvam Saaras v4 STT (transcribe mode),
+    OpenAI LLM reasoning with Supabase CRM tools, and Sarvam Bulbul v3 TTS.
     """
 
     def __init__(
@@ -478,6 +478,7 @@ class VoiceAssistant:
         tts_instance: Any,
         tools_instance: CRMDatabaseTools,
         system_message: str = SYSTEM_PROMPT,
+        initial_language: str = "ml-IN",
     ):
         self.vad = vad_instance
         self.stt = stt_instance
@@ -485,9 +486,86 @@ class VoiceAssistant:
         self.tts = tts_instance
         self.tools = tools_instance
         self.system_message = system_message
+        self.current_language = initial_language
         self._session: Optional[AgentSession] = None
+        self._room: Optional[rtc.Room] = None
+
+    def set_language(self, lang_code: str):
+        """
+        Dynamically updates STT and TTS language configuration on the fly.
+        """
+        if not lang_code:
+            return
+
+        clean = lang_code.strip()
+        if clean in ["ml", "ml-IN"]:
+            target_lang = "ml-IN"
+        elif clean in ["hi", "hi-IN"]:
+            target_lang = "hi-IN"
+        elif clean in ["en", "en-IN", "en-US"]:
+            target_lang = "en-IN"
+        else:
+            target_lang = clean
+
+        if self.current_language == target_lang:
+            return
+
+        self.current_language = target_lang
+        logger.info(f"[Language Switch] Voice assistant language updated to: {self.current_language}")
+
+        # Update Sarvam STT language dynamically
+        if hasattr(self.stt, "_opts") and hasattr(self.stt._opts, "language"):
+            self.stt._opts.language = self.current_language
+            logger.info(f"[STT Config] sarvam.STT language set to: {self.stt._opts.language} (mode={getattr(self.stt._opts, 'mode', 'transcribe')})")
+
+        # Update Sarvam TTS language dynamically
+        if hasattr(self.tts, "_opts") and hasattr(self.tts._opts, "target_language_code"):
+            self.tts._opts.target_language_code = self.current_language
+            logger.info(f"[TTS Config] sarvam.TTS target_language_code set to: {self.tts._opts.target_language_code}")
+
+        # Broadcast update to UI debug panel
+        self.publish_debug_status(live_transcript="", is_final=True)
+
+    def publish_debug_status(
+        self,
+        live_transcript: str = "",
+        is_final: bool = False,
+        detected_lang: Optional[str] = None,
+    ):
+        """
+        Broadcasts real-time STT diagnostics to LiveKit Data Channel topic 'stt_debug'.
+        """
+        if not self._room or not self._room.local_participant:
+            return
+
+        debug_payload = {
+            "type": "stt_debug",
+            "audio_received": True,
+            "stt_provider": "Sarvam AI",
+            "stt_model": "saaras:v4",
+            "configured_language": self.current_language,
+            "detected_language": detected_lang or self.current_language.split("-")[0],
+            "mode": "transcribe",
+            "live_transcript": live_transcript,
+            "response_language": self.current_language,
+            "is_final": is_final,
+        }
+
+        try:
+            raw_json = json.dumps(debug_payload)
+            asyncio.create_task(
+                self._room.local_participant.publish_data(
+                    raw_json,
+                    topic="stt_debug",
+                    reliable=True,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish stt_debug data: {e}")
 
     def start(self, room: rtc.Room):
+        self._room = room
+
         # Register all tools from CRMDatabaseTools
         tools_list = [
             self.tools.get_all_contacts,
@@ -526,6 +604,21 @@ class VoiceAssistant:
             tts=self.tts,
             tools=tools_list,
         )
+
+        # Listen for real-time user input transcription events
+        @self._session.on("user_input_transcribed")
+        def on_user_input_transcribed(event):
+            detected = str(event.language) if getattr(event, "language", None) else self.current_language.split("-")[0]
+            logger.info(
+                f"[STT Transcribed] '{event.transcript}' | final={event.is_final} | "
+                f"lang={self.current_language} | detected={detected} | mode=transcribe"
+            )
+            self.publish_debug_status(
+                live_transcript=event.transcript,
+                is_final=event.is_final,
+                detected_lang=detected,
+            )
+
         return asyncio.create_task(self._session.start(room=room, agent=agent))
 
     async def say(self, message: str, allow_interruptions: bool = True):
@@ -542,55 +635,37 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"Connecting to LiveKit Room: {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # 1. Silero Voice Activity Detection (VAD)
-    vad_instance = silero.VAD.load()
+    # 1. Silero Voice Activity Detection (VAD) tuned for Malayalam & short utterances
+    vad_instance = silero.VAD.load(
+        min_speech_duration=0.05,
+        min_silence_duration=0.55,
+        prefix_padding_duration=0.5,
+        sample_rate=16000,
+    )
 
-    # 2. Multilingual Speech-to-Text (STT) - Sarvam Saaras v4
-    if PRIMARY_STT_PROVIDER == "sarvam" and SARVAM_API_KEY:
-        stt_instance = sarvam.STT(
-            api_key=SARVAM_API_KEY,
-            language="ml-IN",
-            model="saaras:v4",
-        )
-    elif OPENAI_API_KEY:
-        stt_instance = openai.STT(
-            api_key=OPENAI_API_KEY,
-            model="whisper-1",
-            language="en",
-        )
-    else:
-        stt_instance = sarvam.STT(
-            api_key=SARVAM_API_KEY,
-            language="ml-IN",
-            model="saaras:v4",
-        )
+    # 2. Multilingual Speech-to-Text (STT) - Sarvam Saaras v4 (Strictly 'transcribe' mode, never translate)
+    stt_instance = sarvam.STT(
+        api_key=SARVAM_API_KEY,
+        model="saaras:v4",
+        language="ml-IN",
+        mode="transcribe",
+        sample_rate=16000,
+        high_vad_sensitivity=True,
+    )
 
     # 3. LLM Reasoning Model - OpenAI gpt-4o-mini
     llm_instance = openai.LLM(
         model="gpt-4o-mini",
-        api_key=OPENAI_API_KEY or "dummy-key-for-worker-init",
+        api_key=OPENAI_API_KEY,
     )
 
-    # 4. Multilingual Text-to-Speech (TTS) - Sarvam Bulbul v3 for Malayalam/Hindi
-    if PRIMARY_TTS_PROVIDER == "sarvam" and SARVAM_API_KEY:
-        tts_instance = sarvam.TTS(
-            api_key=SARVAM_API_KEY,
-            target_language_code="ml-IN",
-            model="bulbul:v3",
-            speaker="kavya",
-        )
-    elif CARTESIA_API_KEY:
-        tts_instance = cartesia.TTS(
-            voice="694f12bc-c40d-4460-a021-9152e4ba9588",
-            api_key=CARTESIA_API_KEY,
-        )
-    else:
-        tts_instance = sarvam.TTS(
-            api_key=SARVAM_API_KEY,
-            target_language_code="ml-IN",
-            model="bulbul:v3",
-            speaker="kavya",
-        )
+    # 4. Multilingual Text-to-Speech (TTS) - Sarvam Bulbul v3 with Kavya voice
+    tts_instance = sarvam.TTS(
+        api_key=SARVAM_API_KEY,
+        model="bulbul:v3",
+        target_language_code="ml-IN",
+        speaker="kavya",
+    )
 
     # 5. Live Supabase Database Tools
     crm_tools = CRMDatabaseTools(
@@ -599,7 +674,7 @@ async def entrypoint(ctx: JobContext):
         function_url=SUPABASE_FUNCTION_URL,
     )
 
-    # 6. Initialize Multilingual Voice Assistant
+    # 6. Initialize Multilingual Voice Assistant (defaults to Malayalam ml-IN)
     assistant = VoiceAssistant(
         vad_instance=vad_instance,
         stt_instance=stt_instance,
@@ -607,11 +682,57 @@ async def entrypoint(ctx: JobContext):
         tts_instance=tts_instance,
         tools_instance=crm_tools,
         system_message=SYSTEM_PROMPT,
+        initial_language="ml-IN",
     )
+
+    # Helper for parsing participant metadata / data message
+    def handle_incoming_metadata(meta_str: Optional[str]):
+        if not meta_str:
+            return
+        try:
+            data = json.loads(meta_str)
+            lang = data.get("language")
+            if lang:
+                assistant.set_language(lang)
+        except Exception:
+            pass
+
+    # Listen for participant metadata changes (from UI language selection)
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(p: rtc.RemoteParticipant):
+        logger.info(f"Participant connected: {p.identity} (meta={p.metadata})")
+        handle_incoming_metadata(p.metadata)
+
+    @ctx.room.on("participant_metadata_changed")
+    def on_participant_metadata_changed(p: rtc.Participant, prev_meta: str):
+        logger.info(f"Participant metadata changed: {p.identity} -> {p.metadata}")
+        handle_incoming_metadata(p.metadata)
+
+    # Listen for direct data channel messages from client UI
+    @ctx.room.on("data_received")
+    def on_data_received(dp: rtc.DataPacket):
+        try:
+            text = dp.data.decode("utf-8")
+            data = json.loads(text)
+            if data.get("type") == "set_language":
+                lang = data.get("language")
+                if lang:
+                    logger.info(f"[DataChannel] Received set_language: {lang}")
+                    assistant.set_language(lang)
+        except Exception as e:
+            logger.warning(f"Error handling data packet: {e}")
+
+    # Inspect any participants already in room
+    for p in ctx.room.remote_participants.values():
+        if p.metadata:
+            handle_incoming_metadata(p.metadata)
 
     # Start audio session in LiveKit room
     assistant.start(ctx.room)
     logger.info("Vynzora AI Voice Agent active and listening.")
+
+    # Broadcast initial debug state
+    assistant.publish_debug_status(live_transcript="", is_final=True)
 
     # 7. Initial Greeting in Malayalam
     greeting_ml = "നമസ്കാരം! വിൻസോറ CRM-ലേക്ക് സ്വാഗതം. ഞാൻ നിങ്ങളെ എങ്ങനെയാണ് സഹായിക്കേണ്ടത്?"
