@@ -959,13 +959,26 @@ async function semanticBusinessEngine(
     toolsUsed.push('get_all_contact_details');
     const res = await getAllContactDetails();
 
+    let detailsList = res.contacts
+      .map(
+        (c) =>
+          `• **${c.full_name}** (${c.company_name}) | Email: ${c.email} | Phone: ${c.phone_number || 'N/A'} | Service: ${c.service_required}`
+      )
+      .join('\n');
+
     let reply = '';
     if (lang === 'ml') {
-      reply = `നമ്മുടെ ഡാറ്റാബേസിലെ മുഴുവൻ (**${res.total}**) കസ്റ്റമർ കോൺടാക്റ്റുകളുടെയും പൂർണ്ണ വിവരങ്ങൾ (പേര്, കമ്പനി, ഇമെയിൽ, ഫോൺ, സർവീസ്, മെസ്സേജ്, തീയതി) താഴെ നൽകുന്നു:`;
+      reply =
+        `നമ്മുടെ ഡാറ്റാബേസിലെ മുഴുവൻ (**${res.total}**) കസ്റ്റമർ കോൺടാക്റ്റുകളുടെയും പൂർണ്ണ വിവരങ്ങൾ താഴെ നൽകുന്നു:\n\n` +
+        detailsList;
     } else if (lang === 'hi') {
-      reply = `हमारे डेटाबेस के सभी (**${res.total}**) contacts की पूरी जानकारी नीचे दी गई है:`;
+      reply =
+        `हमारे डेटाबेस के सभी (**${res.total}**) contacts की पूरी जानकारी नीचे दी गई है:\n\n` +
+        detailsList;
     } else {
-      reply = `Here are the complete details of all **${res.total} customer contacts** in the Vynzora database:`;
+      reply =
+        `Here are the complete details of all **${res.total} customer contacts** in the Vynzora database:\n\n` +
+        detailsList;
     }
 
     return complete('database_query', 'get_all_contact_details', reply, toolsUsed, res.total, {
@@ -989,8 +1002,9 @@ async function semanticBusinessEngine(
   // 4-FIVE: CONTACT COUNT (Intent C) - Evaluated before listing names
   // "How many contacts are there?", "Total contacts?", "എത്ര കോൺടാക്റ്റുകൾ ഉണ്ട്?", "ആകെ എത്ര contacts ഉണ്ട്?", "कुल कितने contacts हैं?"
   // --------------------------------------------------------------------------
-  const isDateFiltered = cleanQ.includes('today') || cleanQ.includes('ഈ മാസം') || cleanQ.includes('this month') || cleanQ.includes('ഇന്ന്');
+  const isExplicitEnquiriesQuery = cleanQ.includes('enquir') || cleanQ.includes('അന്വേഷണ');
   const isContactCountQuery =
+    !isExplicitEnquiriesQuery &&
     (cleanQ.includes('customer') || cleanQ.includes('contact') || cleanQ.includes('കസ്റ്റമർ') || cleanQ.includes('കോൺടാക്റ്റ')) &&
     (cleanQ.includes('how many') ||
       cleanQ.includes('total number') ||
@@ -998,13 +1012,19 @@ async function semanticBusinessEngine(
       cleanQ.includes('what is the count') ||
       cleanQ.includes('count of contacts') ||
       cleanQ.includes('total contacts') ||
+      cleanQ.includes('contacts do we have') ||
+      cleanQ.includes('customers do we have') ||
       cleanQ.includes('ആകെ എത്ര') ||
       cleanQ.includes('എത്ര കോൺടാക്റ്റുകൾ') ||
       cleanQ.includes('എത്ര contacts') ||
       cleanQ.includes('കുൽ കിത്നേ') ||
-      cleanQ.includes('कुल कितने'));
+      cleanQ.includes('कुल कितने') ||
+      cleanQ.includes('कितने contacts') ||
+      cleanQ.includes('कितने contact') ||
+      cleanQ.includes('कितने ग्राहक') ||
+      cleanQ.includes('contacts count'));
 
-  if (isContactCountQuery && !isDateFiltered) {
+  if (isContactCountQuery) {
     toolsUsed.push('get_total_contacts');
     const contacts = await getTotalContacts();
 
@@ -1027,6 +1047,7 @@ async function semanticBusinessEngine(
   const isAllContactsListQuery =
     !isContactCountQuery &&
     (cleanQ === 'show all contacts' ||
+      cleanQ === 'show me all contacts' ||
       cleanQ === 'list all contacts' ||
       cleanQ === 'list all contact names' ||
       cleanQ === 'all contacts' ||
@@ -1039,6 +1060,8 @@ async function semanticBusinessEngine(
       cleanQ === 'give me every contact in the database' ||
       cleanQ === 'all contact names' ||
       cleanQ.includes('show all contacts') ||
+      cleanQ.includes('show me all contacts') ||
+      cleanQ.includes('show me contacts') ||
       cleanQ.includes('list all contact') ||
       cleanQ.includes('get all customer contacts') ||
       cleanQ.includes('give me every contact') ||
@@ -1186,8 +1209,25 @@ async function semanticBusinessEngine(
   // "crm leads", "leads", "qualified leads", "which leads are still new?", "who needs follow-up?"
   // --------------------------------------------------------------------------
 
-  // 4C-1. Direct CRM entity overview: "crm leads" or "leads"
-  if (cleanQ === 'crm leads' || cleanQ === 'leads' || cleanQ === 'crm' || cleanQ === 'സിആർഎം ലീഡുകൾ' || cleanQ === 'ലീഡുകൾ') {
+  // 4C-1. Direct CRM entity overview: "crm leads" or "leads", "how many leads do we have?"
+  if (
+    cleanQ === 'crm leads' ||
+    cleanQ === 'leads' ||
+    cleanQ === 'crm' ||
+    cleanQ === 'സിആർഎം ലീഡുകൾ' ||
+    cleanQ === 'ലീഡുകൾ' ||
+    cleanQ.includes('how many leads') ||
+    cleanQ.includes('leads do we have') ||
+    cleanQ.includes('total leads') ||
+    cleanQ.includes('number of leads') ||
+    cleanQ.includes('crm summary') ||
+    cleanQ.includes('leads summary') ||
+    cleanQ.includes('leads count') ||
+    cleanQ.includes('എത്ര leads ഉണ്ട്') ||
+    cleanQ.includes('ആകെ എത്ര leads') ||
+    cleanQ.includes('कितने leads हैं') ||
+    cleanQ.includes('कुल कितने leads')
+  ) {
     toolsUsed.push('get_crm_summary', 'get_latest_leads');
     const [crm, latest] = await Promise.all([getCrmSummary(), getLatestLeads(6)]);
 

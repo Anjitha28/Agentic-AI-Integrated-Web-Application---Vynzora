@@ -26,7 +26,6 @@ function splitTextIntoChunks(text: string, maxLength: number = 150): string[] {
       if (sentence.length <= maxLength) {
         current = sentence;
       } else {
-        // Break long sentence by words
         const words = sentence.split(' ');
         let wordChunk = '';
         for (const w of words) {
@@ -43,13 +42,59 @@ function splitTextIntoChunks(text: string, maxLength: number = 150): string[] {
   }
   if (current) chunks.push(current);
 
-  return chunks.slice(0, 5); // Limit to top 5 chunks (~400 chars) for crisp conversational audio
+  return chunks.slice(0, 5);
 }
 
 /**
- * Fetch a single audio buffer from Google's neural TTS engine.
+ * Synthesize speech using Sarvam AI Bulbul v3 (Malayalam ml-IN, Hindi hi-IN, English en-IN).
  */
-function fetchTtsChunk(text: string, lang: string): Promise<Buffer> {
+async function fetchSarvamBulbulTts(
+  text: string,
+  langCode: string,
+  apiKey: string
+): Promise<Buffer | null> {
+  try {
+    const clean = text
+      .replace(/[*#_`~>]/g, '')
+      .replace(/•/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!clean) return null;
+
+    const res = await fetch('https://api.sarvam.ai/text-to-speech', {
+      method: 'POST',
+      headers: {
+        'api-subscription-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        inputs: [clean.slice(0, 450)],
+        target_language_code: langCode,
+        speaker: 'kavya',
+        model: 'bulbul:v3',
+      }),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const audios = data.audios;
+      if (Array.isArray(audios) && audios.length > 0 && typeof audios[0] === 'string') {
+        return Buffer.from(audios[0], 'base64');
+      }
+    } else {
+      console.warn(`Sarvam TTS returned status ${res.status}:`, await res.text());
+    }
+  } catch (err) {
+    console.warn('Sarvam Bulbul TTS exception:', err);
+  }
+  return null;
+}
+
+/**
+ * Fallback to Google Neural TTS chunk.
+ */
+function fetchGoogleTtsChunk(text: string, lang: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
       text
@@ -81,6 +126,33 @@ function fetchTtsChunk(text: string, lang: string): Promise<Buffer> {
   });
 }
 
+async function synthesizeAudio(text: string, lang: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  const sarvamKey = process.env.SARVAM_API_KEY;
+  const targetLangCode = lang === 'ml' ? 'ml-IN' : lang === 'hi' ? 'hi-IN' : 'en-IN';
+
+  // 1. Primary: Sarvam Bulbul v3 for Malayalam, Hindi, and Indian English
+  if (sarvamKey && sarvamKey.trim() !== '') {
+    const sarvamAudio = await fetchSarvamBulbulTts(text, targetLangCode, sarvamKey);
+    if (sarvamAudio && sarvamAudio.length > 0) {
+      return { buffer: sarvamAudio, mimeType: 'audio/wav' };
+    }
+  }
+
+  // 2. Secondary: Google Neural TTS
+  const chunks = splitTextIntoChunks(text);
+  if (chunks.length === 0) {
+    throw new Error('No pronounceable text provided');
+  }
+
+  const buffers: Buffer[] = [];
+  for (const chunk of chunks) {
+    const buf = await fetchGoogleTtsChunk(chunk, lang);
+    buffers.push(buf);
+  }
+
+  return { buffer: Buffer.concat(buffers), mimeType: 'audio/mpeg' };
+}
+
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
@@ -91,25 +163,13 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Text parameter is required' }, { status: 400 });
     }
 
-    const chunks = splitTextIntoChunks(text);
-    if (chunks.length === 0) {
-      return NextResponse.json({ error: 'No pronounceable text provided' }, { status: 400 });
-    }
+    const { buffer, mimeType } = await synthesizeAudio(text, lang);
 
-    // Fetch audio chunks sequentially to maintain order
-    const buffers: Buffer[] = [];
-    for (const chunk of chunks) {
-      const buf = await fetchTtsChunk(chunk, lang);
-      buffers.push(buf);
-    }
-
-    const fullAudio = Buffer.concat(buffers);
-
-    return new Response(fullAudio, {
+    return new Response(buffer as unknown as BodyInit, {
       status: 200,
       headers: {
-        'Content-Type': 'audio/mpeg',
-        'Content-Length': fullAudio.length.toString(),
+        'Content-Type': mimeType,
+        'Content-Length': buffer.length.toString(),
         'Cache-Control': 'public, max-age=86400',
       },
     });
@@ -132,24 +192,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Text parameter is required' }, { status: 400 });
     }
 
-    const chunks = splitTextIntoChunks(text);
-    if (chunks.length === 0) {
-      return NextResponse.json({ error: 'No pronounceable text provided' }, { status: 400 });
-    }
+    const { buffer, mimeType } = await synthesizeAudio(text, lang);
 
-    const buffers: Buffer[] = [];
-    for (const chunk of chunks) {
-      const buf = await fetchTtsChunk(chunk, lang);
-      buffers.push(buf);
-    }
-
-    const fullAudio = Buffer.concat(buffers);
-
-    return new Response(fullAudio, {
+    return new Response(buffer as unknown as BodyInit, {
       status: 200,
       headers: {
-        'Content-Type': 'audio/mpeg',
-        'Content-Length': fullAudio.length.toString(),
+        'Content-Type': mimeType,
+        'Content-Length': buffer.length.toString(),
         'Cache-Control': 'public, max-age=86400',
       },
     });
@@ -161,4 +210,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-

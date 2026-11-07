@@ -19,6 +19,8 @@ import {
   Globe,
   CheckCircle2,
   AlertCircle,
+  PhoneCall,
+  PhoneOff,
 } from 'lucide-react';
 import AiMessageBubble, { ChatMessage } from './AiMessageBubble';
 import { detectLanguage, SupportedLanguage, SUPPORTED_LANGUAGES } from '@/lib/ai/languageUtils';
@@ -60,7 +62,7 @@ export default function VynzoraFloatingAssistant() {
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  // Voice Interaction State
+  // Voice Interaction State (Local Speech Recognition & Neural TTS)
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [continuousVoice, setContinuousVoice] = useState(false);
@@ -68,10 +70,19 @@ export default function VynzoraFloatingAssistant() {
   const [selectedLanguage, setSelectedLanguage] = useState<SupportedLanguage>('en');
   const [voiceError, setVoiceError] = useState<string | null>(null);
 
+  // LiveKit WebRTC Voice Agent Connection State
+  const [livekitConnected, setLivekitConnected] = useState(false);
+  const [livekitConnecting, setLivekitConnecting] = useState(false);
+  const [agentSpeaking, setAgentSpeaking] = useState(false);
+  const [micMuted, setMicMuted] = useState(false);
+  const [livekitError, setLivekitError] = useState<string | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const roomRef = useRef<any>(null);
+  const agentAudioElRef = useRef<HTMLAudioElement | null>(null);
 
   // Auto-scroll chat to bottom
   const scrollToBottom = () => {
@@ -84,11 +95,22 @@ export default function VynzoraFloatingAssistant() {
     }
   }, [messages, isOpen, isMinimized, isLoading]);
 
-  // Handle Speech Synthesis & Neural Audio Playback
+  // Clean up LiveKit room on unmount
+  useEffect(() => {
+    return () => {
+      if (roomRef.current) {
+        roomRef.current.disconnect();
+      }
+      if (agentAudioElRef.current) {
+        agentAudioElRef.current.remove();
+      }
+    };
+  }, []);
+
+  // Handle Speech Synthesis & Neural Audio Playback (Sarvam Bulbul v3 / Neural)
   const speakText = useCallback((text: string, lang?: SupportedLanguage) => {
     if (typeof window === 'undefined') return;
 
-    // Stop any existing playing audio or synthesis
     if (audioPlayerRef.current) {
       audioPlayerRef.current.pause();
       audioPlayerRef.current.currentTime = 0;
@@ -99,7 +121,6 @@ export default function VynzoraFloatingAssistant() {
 
     const targetLang = lang || detectLanguage(text);
 
-    // Clean markdown symbols, bullets and links for natural human-like speech
     const cleanSpeech = text
       .replace(/[*#_`~>]/g, '')
       .replace(/•/g, '')
@@ -110,7 +131,7 @@ export default function VynzoraFloatingAssistant() {
 
     if (!cleanSpeech) return;
 
-    // Stream genuine neural voice audio (Malayalam ml-IN, Hindi hi-IN, English en-US)
+    // Stream native Sarvam Bulbul v3 neural voice (ml-IN, hi-IN, en-IN)
     const neuralUrl = `/api/ai/tts?text=${encodeURIComponent(cleanSpeech.slice(0, 450))}&lang=${targetLang}`;
     const audio = new Audio(neuralUrl);
     audioPlayerRef.current = audio;
@@ -158,7 +179,115 @@ export default function VynzoraFloatingAssistant() {
     setIsSpeaking(false);
   }, []);
 
-  // Send message to AI endpoint
+  // ============================================================================
+  // LIVEKIT WEBRTC REAL-TIME VOICE ROOM CONNECTION
+  // ============================================================================
+
+  const connectLiveKit = async () => {
+    try {
+      setLivekitConnecting(true);
+      setLivekitError(null);
+      stopSpeaking();
+      stopListening();
+
+      // 1. Generate connection token from server-side route
+      const res = await fetch('/api/livekit/token?room=vynzora-crm-voice');
+      const data = await res.json();
+
+      if (!res.ok || !data.success || !data.token) {
+        throw new Error(data.error || 'LiveKit server credentials unavailable');
+      }
+
+      // 2. Import livekit-client dynamically in browser
+      const { Room, RoomEvent, Track } = await import('livekit-client');
+
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+      });
+
+      // 3. Setup event listeners
+      room.on(RoomEvent.TrackSubscribed, (track: any) => {
+        if (track.kind === Track.Kind.Audio) {
+          const el = track.attach();
+          agentAudioElRef.current = el;
+          document.body.appendChild(el);
+          setAgentSpeaking(true);
+        }
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track: any) => {
+        track.detach().forEach((el: any) => el.remove());
+        setAgentSpeaking(false);
+      });
+
+      room.on(RoomEvent.ActiveSpeakersChanged, (speakers: any[]) => {
+        const isAgent = speakers.some((s) => !s.isLocal);
+        setAgentSpeaking(isAgent);
+      });
+
+      room.on(RoomEvent.Disconnected, () => {
+        setLivekitConnected(false);
+        setLivekitConnecting(false);
+        setAgentSpeaking(false);
+      });
+
+      // 4. Connect to LiveKit Cloud
+      await room.connect(data.wsUrl, data.token);
+
+      // 5. Publish microphone audio track
+      await room.localParticipant.setMicrophoneEnabled(true);
+
+      roomRef.current = room;
+      setLivekitConnected(true);
+      setLivekitConnecting(false);
+      setMicMuted(false);
+
+      // Welcome message in chat indicating voice agent room joined
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `lk-sys-${Date.now()}`,
+          role: 'assistant',
+          content: '🎙️ Connected to LiveKit Voice Agent. Microphone is live — speak in Malayalam, Hindi, or English.',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          language: selectedLanguage,
+        },
+      ]);
+    } catch (err: any) {
+      console.error('LiveKit room connection error:', err);
+      setLivekitError(err.message || 'Could not connect to LiveKit Voice Room');
+      setLivekitConnected(false);
+      setLivekitConnecting(false);
+    }
+  };
+
+  const disconnectLiveKit = async () => {
+    if (roomRef.current) {
+      await roomRef.current.disconnect();
+      roomRef.current = null;
+    }
+    if (agentAudioElRef.current) {
+      agentAudioElRef.current.remove();
+      agentAudioElRef.current = null;
+    }
+    setLivekitConnected(false);
+    setLivekitConnecting(false);
+    setAgentSpeaking(false);
+  };
+
+  const toggleMic = async () => {
+    if (roomRef.current && roomRef.current.localParticipant) {
+      const nextState = !micMuted;
+      await roomRef.current.localParticipant.setMicrophoneEnabled(!nextState);
+      setMicMuted(nextState);
+    }
+  };
+
+  // ============================================================================
+  // TEXT CHAT & DATABASE ASSISTANT HANDLER
+  // ============================================================================
+
   const handleSendMessage = async (textToSend?: string) => {
     const text = (textToSend || inputValue).trim();
     if (!text || isLoading) return;
@@ -235,7 +364,7 @@ export default function VynzoraFloatingAssistant() {
     }
   };
 
-  // Speech Recognition (Microphone Voice Input)
+  // Local Microphone Voice Input (Web Speech Fallback)
   const startListening = () => {
     stopSpeaking();
     setVoiceError(null);
@@ -252,7 +381,6 @@ export default function VynzoraFloatingAssistant() {
       const recognition = new SpeechRecognition();
       recognition.continuous = false;
       recognition.interimResults = false;
-      // Dynamic Speech Language based on currently active/detected language
       const speechLang =
         selectedLanguage === 'ml' ? 'ml-IN' : selectedLanguage === 'hi' ? 'hi-IN' : 'en-US';
       recognition.lang = speechLang;
@@ -299,11 +427,8 @@ export default function VynzoraFloatingAssistant() {
   };
 
   const handleClearHistory = () => {
-    if (confirm('Clear entire AI conversation history?')) {
-      stopSpeaking();
-      stopListening();
-      setMessages([]);
-    }
+    setMessages([]);
+    stopSpeaking();
   };
 
   return (
@@ -311,31 +436,25 @@ export default function VynzoraFloatingAssistant() {
       {/* Floating Launcher Button */}
       {!isOpen && (
         <button
-          onClick={() => {
-            setIsOpen(true);
-            setIsMinimized(false);
-          }}
-          className="fixed bottom-6 right-6 z-50 group flex items-center gap-3 p-3.5 sm:px-5 sm:py-3.5 rounded-full bg-gradient-to-r from-brand-600 via-indigo-600 to-accent-600 hover:from-brand-500 hover:to-accent-500 text-white shadow-2xl shadow-brand-500/40 hover:scale-105 active:scale-95 transition-all cursor-pointer border border-white/20"
+          onClick={() => setIsOpen(true)}
+          className="fixed bottom-6 right-6 z-50 p-4 rounded-2xl bg-gradient-to-tr from-brand-600 via-indigo-600 to-purple-600 text-white shadow-xl shadow-brand-500/30 hover:scale-105 active:scale-95 transition-all duration-300 flex items-center gap-3 group border border-white/20 cursor-pointer"
           aria-label="Open Vynzora AI Business Assistant"
         >
-          <div className="relative flex items-center justify-center">
-            <Sparkles className="w-5 h-5 text-white animate-pulse" />
-            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-slate-900 animate-ping" />
-            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-slate-900" />
+          <div className="relative">
+            <Sparkles className="w-6 h-6 animate-pulse" />
+            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-slate-950 animate-ping" />
           </div>
-          <div className="hidden sm:flex flex-col text-left">
-            <span className="text-xs font-bold leading-tight flex items-center gap-1.5">
+          <div className="text-left hidden sm:block">
+            <div className="text-xs font-bold leading-tight flex items-center gap-1.5">
               <span>Vynzora AI</span>
-              <span className="text-[10px] px-1.5 py-0.2 rounded bg-white/20 uppercase font-mono">
-                Live
-              </span>
-            </span>
-            <span className="text-[10px] text-white/80">Business Assistant</span>
+              <span className="px-1.5 py-0.2 rounded text-[9px] bg-white/20 font-mono">Live CRM</span>
+            </div>
+            <div className="text-[10px] text-brand-100">Intelligent Business Assistant</div>
           </div>
         </button>
       )}
 
-      {/* Floating Chat Panel */}
+      {/* Main Assistant Window */}
       {isOpen && (
         <div
           className={`fixed bottom-6 right-6 z-50 flex flex-col glass-panel border border-brand-500/30 rounded-3xl shadow-2xl shadow-slate-950/80 overflow-hidden transition-all duration-300 ${
@@ -343,7 +462,7 @@ export default function VynzoraFloatingAssistant() {
               ? 'w-80 h-16'
               : isExpanded
               ? 'w-[94vw] sm:w-[680px] h-[85vh] max-h-[800px]'
-              : 'w-[92vw] sm:w-[450px] h-[78vh] max-h-[680px]'
+              : 'w-[92vw] sm:w-[460px] h-[78vh] max-h-[680px]'
           }`}
         >
           {/* Header */}
@@ -402,6 +521,7 @@ export default function VynzoraFloatingAssistant() {
                 onClick={() => {
                   stopSpeaking();
                   stopListening();
+                  disconnectLiveKit();
                   setIsOpen(false);
                 }}
                 className="p-1.5 rounded-lg hover:text-white hover:bg-slate-900 transition-colors"
@@ -415,11 +535,66 @@ export default function VynzoraFloatingAssistant() {
           {/* Body Content (Visible when not minimized) */}
           {!isMinimized && (
             <>
-              {/* Voice & Language Bar */}
+              {/* LiveKit Voice Connection Status Bar */}
+              <div className="px-4 py-2 bg-indigo-950/40 border-b border-indigo-900/50 flex items-center justify-between text-[11px]">
+                <div className="flex items-center gap-2">
+                  <Radio className={`w-3.5 h-3.5 ${livekitConnected ? 'text-emerald-400 animate-pulse' : 'text-indigo-400'}`} />
+                  <span className="font-semibold text-slate-200">LiveKit Cloud Voice:</span>
+                  {livekitConnected ? (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                      Connected ({agentSpeaking ? 'Speaking' : 'Listening'})
+                    </span>
+                  ) : livekitConnecting ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] text-indigo-300 font-medium">
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      Connecting...
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-slate-400">Idle</span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {livekitConnected ? (
+                    <>
+                      <button
+                        onClick={toggleMic}
+                        className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-all ${
+                          micMuted
+                            ? 'bg-amber-600/30 text-amber-300 border border-amber-500/50'
+                            : 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/50'
+                        }`}
+                        title={micMuted ? 'Unmute microphone' : 'Mute microphone'}
+                      >
+                        {micMuted ? 'Mic Muted' : 'Mic Live'}
+                      </button>
+                      <button
+                        onClick={disconnectLiveKit}
+                        className="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-600/30 hover:bg-rose-600/50 text-rose-300 border border-rose-500/40 transition-colors"
+                        title="Disconnect LiveKit Voice"
+                      >
+                        Disconnect
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={connectLiveKit}
+                      disabled={livekitConnecting}
+                      className="flex items-center gap-1 px-2.5 py-0.5 rounded-lg text-[10px] font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm transition-all active:scale-95 disabled:opacity-50"
+                    >
+                      <PhoneCall className="w-3 h-3" />
+                      <span>Connect Voice</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Multilingual Voice & Neural TTS Bar */}
               <div className="px-4 py-2 bg-slate-900/60 border-b border-slate-800/60 flex items-center justify-between text-[11px] text-slate-400">
                 <div className="flex items-center gap-2">
                   <Globe className="w-3.5 h-3.5 text-brand-400" />
-                  <span>Multilingual:</span>
+                  <span>Language:</span>
                   <div className="flex items-center gap-1 font-mono text-[10px]">
                     {(['en', 'ml', 'hi'] as SupportedLanguage[]).map((langCode) => {
                       const isSelected = selectedLanguage === langCode;
@@ -460,19 +635,25 @@ export default function VynzoraFloatingAssistant() {
                       onChange={(e) => setAutoVoiceEnabled(e.target.checked)}
                       className="rounded bg-slate-800 border-slate-700 text-brand-500 focus:ring-0 w-3 h-3 cursor-pointer"
                     />
-                    <span>Neural Voice</span>
+                    <span>Sarvam TTS</span>
                   </label>
                 </div>
               </div>
 
               {/* Error banner */}
-              {voiceError && (
+              {(voiceError || livekitError) && (
                 <div className="p-2.5 bg-rose-950/60 border-b border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
                     <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                    <span>{voiceError}</span>
+                    <span>{voiceError || livekitError}</span>
                   </div>
-                  <button onClick={() => setVoiceError(null)} className="p-0.5 hover:text-white">
+                  <button
+                    onClick={() => {
+                      setVoiceError(null);
+                      setLivekitError(null);
+                    }}
+                    className="p-0.5 hover:text-white"
+                  >
                     <X className="w-3 h-3" />
                   </button>
                 </div>
@@ -541,11 +722,11 @@ export default function VynzoraFloatingAssistant() {
                   </div>
                 )}
 
-                {/* Chat History */}
-                {messages.map((m) => (
+                {/* Message Bubbles */}
+                {messages.map((message) => (
                   <AiMessageBubble
-                    key={m.id}
-                    message={m}
+                    key={message.id}
+                    message={message}
                     onSpeak={speakText}
                     isSpeaking={isSpeaking}
                     onStopSpeak={stopSpeaking}
@@ -661,4 +842,3 @@ export default function VynzoraFloatingAssistant() {
     </>
   );
 }
-
