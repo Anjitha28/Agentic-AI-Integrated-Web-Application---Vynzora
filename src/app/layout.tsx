@@ -1,5 +1,4 @@
 import type { Metadata } from 'next';
-import Script from 'next/script';
 import './globals.css';
 import Navbar from '@/components/layout/Navbar';
 import Footer from '@/components/layout/Footer';
@@ -21,15 +20,6 @@ export default function RootLayout({
         <Navbar />
         <main className="flex-1">{children}</main>
         <Footer />
-
-        {/* LiveKit New Agent Voice + Chat Popup */}
-        <Script
-          src="https://cloud.livekit.io/embed-popup.js"
-          data-lk-agent="CA_aMZDnDtAkDr7"
-          data-lk-color="#002CF2"
-          data-lk-chat="true"
-          strategy="lazyOnload"
-        />
       </body>
     </html>
   );
