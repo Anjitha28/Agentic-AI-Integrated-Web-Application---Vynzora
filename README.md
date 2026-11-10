@@ -1,6 +1,6 @@
 # VYNZORA – CRM & Business Management Web Application
 
-> Premium Marketing & Branding Web Platform with Supabase Database Architecture, Real-Time Notifications, and LiveKit Voice AI Agent Integration.
+> Premium Marketing & Branding Web Platform with Supabase Database Architecture and Real-Time Notifications.
 
 ---
 
@@ -28,17 +28,6 @@
    - Real-time visual analytics charts for Service Enquiries and Lead Pipeline stages.
    - Complete CRM management: Add, Edit, Delete, Search, Filter, Sort, and Status Tracking (`New`, `Contacted`, `Interested`, `Follow-up Required`, `Converted`, `Lost`).
 
-5. **Future LiveKit Voice AI Agent Ready Architecture**
-   - 7 dedicated secure voice API endpoints returning natural language `voice_summary` and structured JSON payloads:
-     - `GET /api/voice/notifications/new`
-     - `GET /api/voice/notifications/upcoming`
-     - `GET /api/voice/notifications`
-     - `GET /api/voice/crm/leads`
-     - `GET /api/voice/crm/contacts`
-     - `GET /api/voice/crm/summary`
-     - `GET /api/voice/crm/followups`
-   - Interactive in-browser Voice Agent Simulation Sandbox with browser Text-to-Speech audio feedback.
-
 ---
 
 ## 🚀 Quick Start (Local Development)
@@ -59,7 +48,7 @@ NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-public-key
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-secret-key
 ```
-*(Note: If left empty initially, Vynzora will run in a high-fidelity mock storage engine mode so you can test all UI, CRM, and voice endpoints immediately).*
+*(Note: If left empty initially, Vynzora will run in a high-fidelity mock storage engine mode so you can test all UI and CRM modules immediately).*
 
 ### 3. Setup Supabase Database
 Execute the SQL migration scripts in your Supabase SQL Editor:
@@ -91,4 +80,3 @@ Navigate to `/admin`:
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY`
 4. Deploy! Vercel will automatically read `vercel.json` for scheduled cron notification activations.
-
