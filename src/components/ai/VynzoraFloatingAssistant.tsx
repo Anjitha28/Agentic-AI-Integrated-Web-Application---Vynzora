@@ -22,6 +22,7 @@ import {
   Play,
   Pause,
   Moon,
+  Activity,
 } from 'lucide-react';
 
 export interface ChatMessage {
@@ -34,18 +35,27 @@ export interface ChatMessage {
   isVoiceInput?: boolean;
 }
 
+// 7 Distinct States as per Section 10
 export type AssistantVoiceState =
-  | 'standby' // Standby: continuous background wake-word listening ("Hey", "Hey Vynzora AI", "Vynzora AI")
-  | 'waking' // Wake word triggered: speaking "Hello! I'm Vynzora AI. How can I help you?"
-  | 'listening' // Actively recording user's spoken question hands-free
-  | 'processing' // Sending to backend (Sarvam STT -> Gemini -> gTTS)
-  | 'speaking' // Playing back synthesized response audio
-  | 'followup' // Active conversation: waiting for follow-up question without repeating "Hey"
-  | 'disabled'; // Wake-word detection disabled by user
+  | 'standby' // 1. Standby: Waiting for the wake word ("Hey", "Hey Vynzora AI", "Vynzora AI")
+  | 'activated' // 2. Activated: Wake word detected; greeting the user ("Hello! I'm listening. How can I help you?")
+  | 'listening' // 3. Listening: Capturing the user's question hands-free
+  | 'processing' // 4. Processing: Automatically processing speech after silence detection
+  | 'speaking' // 5. Speaking: Playing the AI voice response
+  | 'conversation' // 6. Conversation: Waiting for the next question (turn-taking mode)
+  | 'sleep' // 7. Sleep: Returning to wake-word detection mode
+  | 'disabled'; // Wake-word detection explicitly disabled by user
 
-// Regex matching wake phrases: "Hey", "Hey Vynzora AI", "Vynzora AI", and phonetic/accent variants
+// Configurable Silence Detection Parameters (Section 8)
+const SILENCE_DURATION_MS = 1800; // 1.8 seconds of continuous silence after speech -> auto submit
+const SPEECH_VOLUME_THRESHOLD = 14; // RMS amplitude threshold to detect human speech
+const MIN_SPEECH_DURATION_MS = 300; // Minimum 300ms of actual speech required before silence detection arms
+const MAX_RECORDING_TIMEOUT_MS = 18000; // 18 seconds maximum recording timeout
+const INACTIVITY_TIMEOUT_MS = 9000; // 9 seconds without speech before returning to standby
+
+// Regex matching accepted wake phrases: "Hey", "Hey Vynzora AI", "Vynzora AI"
 const WAKE_WORD_REGEX =
-  /\b(hey\s+v[iy]nzora(\s+ai)?|v[iy]nzora(\s+ai)?|hey\s+winzora(\s+ai)?|winzora(\s+ai)?|hey\s+zora(\s+ai)?|zora\s+ai|വിൻസോറ|ഹേയ്\s+വിൻസോറ|हाय\s+विन्ज़ोरा|विन्ज़ोरा|\bhey\b)\b/i;
+  /\b(hey\s+v[iy]nzora(\s+ai)?|v[iy]nzora(\s+ai)?|hey\s+winzora(\s+ai)?|winzora(\s+ai)?|hey\s+zora(\s+ai)?|zora\s+ai|വിൻസോറ|ഹേയ്\s+വിൻസോറ|हाय\s+വിन्ज़ोरा|विन्ज़ोरा|\bhey\b)\b/i;
 
 // Regex matching sleep/stop commands during active conversation
 const SLEEP_WORD_REGEX =
@@ -71,15 +81,17 @@ export default function VynzoraFloatingAssistant() {
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
 
-  // Audio Recording State (Browser MediaRecorder -> Sarvam Saaras v3)
+  // Audio Recording State
   const [isRecording, setIsRecording] = useState(false);
+  const [isManualRecording, setIsManualRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
+  const [liveAudioLevel, setLiveAudioLevel] = useState(0);
 
   // Audio Playback State (gTTS)
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [currentAudioUrl, setCurrentAudioUrl] = useState<string | null>(null);
 
-  // Automatic Hands-Free Wake-Word ("Hey", "Hey Vynzora AI") State
+  // Voice Interaction State Management (Section 10)
   const [isWakeWordEnabled, setIsWakeWordEnabled] = useState(true);
   const [voiceState, setVoiceState] = useState<AssistantVoiceState>('standby');
   const [micPermission, setMicPermission] = useState<'granted' | 'prompt' | 'denied' | 'checking'>('checking');
@@ -88,7 +100,7 @@ export default function VynzoraFloatingAssistant() {
   const [backendStatus, setBackendStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Refs for audio and timers
+  // Refs for audio, DOM, and timers
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -99,9 +111,11 @@ export default function VynzoraFloatingAssistant() {
   const wakeWordRecRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const vadIntervalRef = useRef<any>(null);
-  const followUpTimerRef = useRef<any>(null);
+  const conversationInactivityTimerRef = useRef<any>(null);
 
-  // Up-to-date state mirrors to prevent stale closure issues in audio callbacks
+  // Duplicate submission guard & state mirrors
+  const isSubmittingRef = useRef(false);
+  const hasSpokenRef = useRef(false);
   const voiceStateRef = useRef<AssistantVoiceState>('standby');
   voiceStateRef.current = voiceState;
   const isPlayingAudioRef = useRef(false);
@@ -171,8 +185,8 @@ export default function VynzoraFloatingAssistant() {
       if (vadIntervalRef.current) {
         clearInterval(vadIntervalRef.current);
       }
-      if (followUpTimerRef.current) {
-        clearTimeout(followUpTimerRef.current);
+      if (conversationInactivityTimerRef.current) {
+        clearTimeout(conversationInactivityTimerRef.current);
       }
       if (wakeWordRecRef.current) {
         try {
@@ -248,11 +262,11 @@ export default function VynzoraFloatingAssistant() {
     [stopAudio]
   );
 
-  // Play Wake Acknowledgement: "Hello! I'm Vynzora AI. How can I help you?"
+  // Play Wake Acknowledgement: "Hello! I'm listening. How can I help you?"
   const playWakeAcknowledgement = useCallback(
     (onComplete: () => void) => {
       stopAudio();
-      setVoiceState('waking');
+      setVoiceState('activated');
       setIsPlayingAudio(true);
 
       const ackAudio = new Audio('/audio/wake_acknowledgement.mp3');
@@ -260,17 +274,17 @@ export default function VynzoraFloatingAssistant() {
 
       const finishAck = () => {
         setIsPlayingAudio(false);
-        // Small safety delay to prevent acoustic feedback into microphone
+        // Safety gap before activating microphone to prevent acoustic feedback
         setTimeout(() => {
           onComplete();
-        }, 300);
+        }, 350);
       };
 
       ackAudio.onended = finishAck;
       ackAudio.onerror = () => {
         // Fallback to browser SpeechSynthesis if MP3 fails
         if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-          const utter = new SpeechSynthesisUtterance("Hello! I'm Vynzora AI. How can I help you?");
+          const utter = new SpeechSynthesisUtterance("Hello! I'm listening. How can I help you?");
           utter.rate = 1.0;
           utter.onend = finishAck;
           utter.onerror = finishAck;
@@ -281,7 +295,6 @@ export default function VynzoraFloatingAssistant() {
       };
 
       ackAudio.play().catch(() => {
-        // Autoplay policy fallback: proceed directly
         finishAck();
       });
     },
@@ -292,7 +305,7 @@ export default function VynzoraFloatingAssistant() {
   const playSleepResponse = useCallback(() => {
     stopAudio();
     stopRecording();
-    setVoiceState('standby');
+    setVoiceState('sleep');
 
     const sleepMsg: ChatMessage = {
       id: `assistant-sleep-${Date.now()}`,
@@ -303,15 +316,19 @@ export default function VynzoraFloatingAssistant() {
 
     setMessages((prev) => [...prev, sleepMsg]);
 
+    const returnToStandby = () => {
+      setVoiceState('standby');
+      startWakeWordListening();
+    };
+
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      const utter = new SpeechSynthesisUtterance("Going to sleep. Say 'Hey' whenever you need me.");
+      const utter = new SpeechSynthesisUtterance("Going to sleep. Say 'Hey' or 'Hey Vynzora AI' whenever you need me.");
       utter.rate = 1.0;
-      utter.onend = () => {
-        startWakeWordListening();
-      };
+      utter.onend = returnToStandby;
+      utter.onerror = returnToStandby;
       window.speechSynthesis.speak(utter);
     } else {
-      startWakeWordListening();
+      setTimeout(returnToStandby, 800);
     }
   }, [stopAudio]);
 
@@ -323,7 +340,7 @@ export default function VynzoraFloatingAssistant() {
       const text = (textToSend || inputValue).trim();
       if (!text || isLoadingRef.current) return;
 
-      // Handle Sleep / Stop commands
+      // Check for sleep/stop commands
       if (SLEEP_WORD_REGEX.test(text)) {
         setInputValue('');
         playSleepResponse();
@@ -395,7 +412,7 @@ export default function VynzoraFloatingAssistant() {
   );
 
   // ============================================================================
-  // MULTILINGUAL VOICE HANDLER (MEDIARECORDER -> SARVAM -> GEMINI -> GTTS)
+  // MULTILINGUAL VOICE HANDLER WITH AUTOMATIC SILENCE DETECTION (NO FINISH BUTTON)
   // ============================================================================
   const cleanupVAD = useCallback(() => {
     if (vadIntervalRef.current) {
@@ -408,6 +425,7 @@ export default function VynzoraFloatingAssistant() {
       } catch {}
       audioContextRef.current = null;
     }
+    setLiveAudioLevel(0);
   }, []);
 
   const stopRecording = useCallback(() => {
@@ -422,10 +440,23 @@ export default function VynzoraFloatingAssistant() {
       } catch {}
     }
     setIsRecording(false);
+    setIsManualRecording(false);
   }, [cleanupVAD]);
 
   const processVoiceBlob = useCallback(
     async (audioBlob: Blob) => {
+      // Avoid submitting empty recordings
+      if (!audioBlob || audioBlob.size < 800 || !hasSpokenRef.current) {
+        console.log('[Vynzora VAD] Discarding empty/silent recording.');
+        isSubmittingRef.current = false;
+        // If in conversation mode, return to standby gracefully
+        if (voiceStateRef.current === 'conversation' || voiceStateRef.current === 'listening') {
+          setVoiceState('standby');
+          startWakeWordListening();
+        }
+        return;
+      }
+
       setIsLoading(true);
       setErrorMessage(null);
       setVoiceState('processing');
@@ -445,8 +476,7 @@ export default function VynzoraFloatingAssistant() {
         const data = await res.json();
 
         if (!res.ok || data.status !== 'success') {
-          // If no speech was captured, return silently to standby
-          if (data.status === 'unrecognized' || data.transcript === '') {
+          if (data.status === 'unrecognized' || !data.transcript || data.transcript.trim() === '') {
             handleResponseAudioFinished();
             return;
           }
@@ -459,7 +489,7 @@ export default function VynzoraFloatingAssistant() {
           return;
         }
 
-        // Add user recognized speech to messages (preserving original script)
+        // Add user recognized speech (original Malayalam, Hindi, or English script)
         const userMessage: ChatMessage = {
           id: `user-voice-${Date.now()}`,
           role: 'user',
@@ -469,7 +499,7 @@ export default function VynzoraFloatingAssistant() {
           isVoiceInput: true,
         };
 
-        // Add assistant response to messages
+        // Add assistant response
         const assistantMessage: ChatMessage = {
           id: `assistant-voice-${Date.now()}`,
           role: 'assistant',
@@ -501,14 +531,15 @@ export default function VynzoraFloatingAssistant() {
         handleResponseAudioFinished();
       } finally {
         setIsLoading(false);
+        isSubmittingRef.current = false;
       }
     },
     [sessionId, playAudioBase64, playSleepResponse]
   );
 
-  // Setup Voice Activity Detection (VAD) for automatic silence detection
+  // Setup Voice Activity and Continuous Silence Detection (Section 8)
   const setupVAD = useCallback(
-    (stream: MediaStream, onSilence: () => void) => {
+    (stream: MediaStream, onSilenceDetected: () => void, onInactivityTimeout: () => void) => {
       try {
         cleanupVAD();
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -522,7 +553,8 @@ export default function VynzoraFloatingAssistant() {
         source.connect(analyser);
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        let hasSpoken = false;
+        hasSpokenRef.current = false;
+        let speechAccumulatedMs = 0;
         let silenceStartTime = 0;
         const startTime = Date.now();
 
@@ -533,34 +565,50 @@ export default function VynzoraFloatingAssistant() {
             sum += dataArray[i];
           }
           const avg = sum / dataArray.length;
+          setLiveAudioLevel(Math.min(100, Math.round(avg * 2.5)));
 
-          // Volume threshold for human speech
-          if (avg > 14) {
-            hasSpoken = true;
-            silenceStartTime = 0;
-          } else if (hasSpoken) {
-            // User began speaking, now paused
+          // Check if current volume corresponds to human speech
+          if (avg >= SPEECH_VOLUME_THRESHOLD) {
+            speechAccumulatedMs += 80;
+            // User has genuinely begun speaking
+            if (speechAccumulatedMs >= MIN_SPEECH_DURATION_MS) {
+              hasSpokenRef.current = true;
+              silenceStartTime = 0; // Reset silence counter while user continues speaking
+            }
+          } else if (hasSpokenRef.current) {
+            // User was speaking, now paused or finished
             if (silenceStartTime === 0) {
               silenceStartTime = Date.now();
-            } else if (Date.now() - silenceStartTime > 1800) {
-              // 1.8 seconds of natural silence detected -> finish and send
+            } else if (Date.now() - silenceStartTime >= SILENCE_DURATION_MS) {
+              // Exactly 1.8 seconds of continuous silence after speech detected!
+              // Auto-stop recording and automatically submit without requiring button click
+              clearInterval(vadIntervalRef.current);
               cleanupVAD();
-              onSilence();
+              onSilenceDetected();
+              return;
             }
           }
 
-          // Max speech recording timeout: 15s
-          if (Date.now() - startTime > 15000) {
+          // Safety timeout: max recording duration
+          if (Date.now() - startTime >= MAX_RECORDING_TIMEOUT_MS) {
+            clearInterval(vadIntervalRef.current);
             cleanupVAD();
-            onSilence();
+            if (hasSpokenRef.current) {
+              onSilenceDetected();
+            } else {
+              onInactivityTimeout();
+            }
+            return;
           }
 
-          // If user triggered wake word but never spoke within 8s -> abort gracefully
-          if (!hasSpoken && Date.now() - startTime > 8000) {
+          // If user triggered conversation mode but never spoke within inactivity window
+          if (!hasSpokenRef.current && Date.now() - startTime >= INACTIVITY_TIMEOUT_MS) {
+            clearInterval(vadIntervalRef.current);
             cleanupVAD();
-            onSilence();
+            onInactivityTimeout();
+            return;
           }
-        }, 100);
+        }, 80);
       } catch (e) {
         console.warn('VAD initialization skipped:', e);
       }
@@ -568,13 +616,19 @@ export default function VynzoraFloatingAssistant() {
     [cleanupVAD]
   );
 
-  // Start voice recording (supports both manual and hands-free automatic VAD mode)
+  // Start voice recording (supports automatic hands-free VAD and manual click mode)
   const startRecording = useCallback(
-    async (isHandsFree = false) => {
+    async (isHandsFree = true) => {
+      // Prevent duplicate microphone recording sessions
+      if (isRecordingRef.current || isPlayingAudioRef.current) return;
+
       try {
         stopAudio();
         setErrorMessage(null);
-        setVoiceState('listening');
+        hasSpokenRef.current = false;
+        isSubmittingRef.current = false;
+        setIsManualRecording(!isHandsFree);
+        setVoiceState(isHandsFree ? 'listening' : 'listening');
 
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -601,7 +655,7 @@ export default function VynzoraFloatingAssistant() {
           await processVoiceBlob(audioBlob);
         };
 
-        mediaRecorder.start(250);
+        mediaRecorder.start(200);
         setIsRecording(true);
         setRecordSeconds(0);
 
@@ -609,24 +663,39 @@ export default function VynzoraFloatingAssistant() {
           setRecordSeconds((sec) => sec + 1);
         }, 1000);
 
-        // In hands-free mode, activate automatic silence detection
+        // Hands-free mode activates silence detection: no "Finish & Send" button click required!
         if (isHandsFree) {
-          setupVAD(stream, () => {
-            stopRecording();
-          });
+          setupVAD(
+            stream,
+            () => {
+              // Silence detected after speech -> automatically stop and send!
+              if (!isSubmittingRef.current) {
+                isSubmittingRef.current = true;
+                stopRecording();
+              }
+            },
+            () => {
+              // User was silent -> do not submit empty audio, return to standby
+              stopRecording();
+              setVoiceState('standby');
+              startWakeWordListening();
+            }
+          );
         }
       } catch (err: any) {
         console.error('Microphone access failed:', err);
         setErrorMessage('Microphone access denied. Please allow microphone permissions.');
         setIsRecording(false);
-        handleResponseAudioFinished();
+        setIsManualRecording(false);
+        setVoiceState('standby');
+        startWakeWordListening();
       }
     },
     [stopAudio, cleanupVAD, processVoiceBlob, setupVAD, stopRecording]
   );
 
   // ============================================================================
-  // WAKE-WORD DETECTION ENGINE ("Hey", "Hey Vynzora AI", "Vynzora AI")
+  // WAKE-WORD DETECTION ENGINE (Accepted: "Hey", "Hey Vynzora AI", "Vynzora AI")
   // ============================================================================
   const startWakeWordListening = useCallback(() => {
     if (
@@ -661,16 +730,18 @@ export default function VynzoraFloatingAssistant() {
       rec.lang = 'en-US';
 
       rec.onresult = (event: any) => {
-        // Echo prevention: Ignore any input while audio is playing or processing
+        // Echo prevention: Strictly ignore any input while audio is playing or processing
         if (isPlayingAudioRef.current || isLoadingRef.current || isRecordingRef.current) {
           return;
         }
 
+        // Section 9: Wake Word Must Control Activation
+        // Only wake words trigger new voice conversations
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript.trim();
 
           if (WAKE_WORD_REGEX.test(transcript)) {
-            console.log('[Wake Word Triggered]:', transcript);
+            console.log('[Wake Word Accepted]:', transcript);
             try {
               rec.abort();
             } catch {}
@@ -688,7 +759,7 @@ export default function VynzoraFloatingAssistant() {
       };
 
       rec.onend = () => {
-        // Automatically restart standby listening if still enabled and not speaking/recording
+        // Automatically restart standby listening if still in standby state
         if (
           isWakeWordEnabledRef.current &&
           !isPlayingAudioRef.current &&
@@ -700,7 +771,7 @@ export default function VynzoraFloatingAssistant() {
             try {
               rec.start();
             } catch {}
-          }, 400);
+          }, 350);
         }
       };
 
@@ -724,26 +795,27 @@ export default function VynzoraFloatingAssistant() {
   // Called when "Hey", "Hey Vynzora AI", or "Vynzora AI" is spoken
   const handleWakeWordTriggered = useCallback(
     (detectedTranscript: string) => {
-      // 1. Open assistant window
+      // 1. Activate assistant window
       setIsOpen(true);
       setIsMinimized(false);
       stopAudio();
       stopWakeWordListening();
 
-      // 2. Check if a question was asked in the same phrase
-      // (e.g., "Hey Vynzora AI, how many enquiries do we have?")
+      // Check if a question was spoken in the exact same phrase
+      // (e.g. "Hey Vynzora AI, how many enquiries do we have?")
       const queryAfterWake = detectedTranscript.replace(WAKE_WORD_REGEX, '').trim();
 
       if (queryAfterWake.length >= 4) {
-        // Direct query provided: process immediately
+        // Direct query provided with wake word
         handleSendMessage(queryAfterWake);
         return;
       }
 
-      // 3. User said pure wake phrase: speak voice acknowledgement
-      // "Hello! I'm Vynzora AI. How can I help you?"
+      // 2. Pure wake word detected -> Transition to Activated state & speak greeting:
+      // "Hello! I'm listening. How can I help you?"
+      setVoiceState('activated');
       playWakeAcknowledgement(() => {
-        // 4. Immediately capture voice question hands-free via MediaRecorder + VAD
+        // 3. Immediately transition to Listening state and record hands-free with silence detection
         startRecording(true);
       });
     },
@@ -751,27 +823,28 @@ export default function VynzoraFloatingAssistant() {
   );
 
   // Transition after assistant response audio completes
-  // Preserves active conversation so user can ask follow-up questions naturally without repeating "Hey"
+  // Preserves active conversation turn-taking so user can ask follow-ups without repeating "Hey"
   const handleResponseAudioFinished = useCallback(() => {
     if (!isWakeWordEnabledRef.current) {
       setVoiceState('disabled');
       return;
     }
 
-    // Enter active conversation turn-taking mode for 8 seconds
-    setVoiceState('followup');
+    // State: Conversation (Waiting for next question naturally)
+    setVoiceState('conversation');
 
-    if (followUpTimerRef.current) {
-      clearTimeout(followUpTimerRef.current);
+    if (conversationInactivityTimerRef.current) {
+      clearTimeout(conversationInactivityTimerRef.current);
     }
 
-    // Give user an 8-second window to ask follow-up questions naturally
-    followUpTimerRef.current = setTimeout(() => {
+    // 9-second conversation turn-taking window
+    conversationInactivityTimerRef.current = setTimeout(() => {
+      // Inactivity: gracefully return to wake-word standby mode
       setVoiceState('standby');
       startWakeWordListening();
-    }, 8000);
+    }, INACTIVITY_TIMEOUT_MS);
 
-    // Start hands-free listening for follow-up question
+    // Automatically begin hands-free listening with silence detection
     startRecording(true);
   }, [startWakeWordListening, startRecording]);
 
@@ -786,7 +859,6 @@ export default function VynzoraFloatingAssistant() {
     const initMicrophoneOnLoad = async () => {
       try {
         if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          // 1. Automatically request microphone on page load
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           stream.getTracks().forEach((track) => track.stop());
           if (mounted) {
@@ -796,7 +868,7 @@ export default function VynzoraFloatingAssistant() {
           return;
         }
       } catch (err: any) {
-        console.log('[Vynzora AI] Microphone prompt deferred or requires user gesture:', err.message);
+        console.log('[Vynzora AI] Mic prompt deferred or requires user gesture:', err.message);
         if (mounted) {
           if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
             setMicPermission('denied');
@@ -805,8 +877,7 @@ export default function VynzoraFloatingAssistant() {
           }
         }
 
-        // Fallback for browsers with strict gesture policies:
-        // Automatically request permission on the very first user click anywhere in the Admin Dashboard
+        // Gesture fallback: activate seamlessly on first user interaction anywhere
         const onFirstInteraction = async () => {
           window.removeEventListener('click', onFirstInteraction);
           window.removeEventListener('keydown', onFirstInteraction);
@@ -882,7 +953,7 @@ export default function VynzoraFloatingAssistant() {
 
   return (
     <>
-      {/* Floating Permission Prompt Banner (Only if browser blocked initial auto-request) */}
+      {/* Floating Permission Prompt Banner (Only shown if browser blocked initial auto-request) */}
       {micPermission === 'prompt' && !isOpen && (
         <button
           onClick={requestMicPermissionManually}
@@ -918,6 +989,8 @@ export default function VynzoraFloatingAssistant() {
                   ? 'bg-amber-400 animate-ping'
                   : voiceState === 'speaking'
                   ? 'bg-purple-400 animate-pulse'
+                  : voiceState === 'processing'
+                  ? 'bg-cyan-400 animate-spin'
                   : backendStatus === 'online'
                   ? 'bg-emerald-400 animate-pulse'
                   : 'bg-rose-400'
@@ -938,11 +1011,13 @@ export default function VynzoraFloatingAssistant() {
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 <span>
                   {voiceState === 'listening'
-                    ? 'Listening...'
+                    ? 'Listening... (Speak now)'
+                    : voiceState === 'processing'
+                    ? 'Processing speech...'
                     : voiceState === 'speaking'
-                    ? 'Speaking...'
-                    : voiceState === 'followup'
-                    ? 'Listening for follow-up...'
+                    ? 'Speaking response...'
+                    : voiceState === 'conversation'
+                    ? 'Turn-taking active (Speak naturally)'
                     : 'Say "Hey" or "Hey Vynzora AI"'}
                 </span>
               </div>
@@ -986,7 +1061,7 @@ export default function VynzoraFloatingAssistant() {
                     {backendStatus === 'online' ? 'Gemini 3.5' : 'Offline'}
                   </span>
 
-                  {/* Subtle Voice Activation Mode Indicator / Toggle */}
+                  {/* 7-State Visual Status Pill (Section 10) */}
                   <button
                     onClick={toggleWakeWord}
                     type="button"
@@ -1000,12 +1075,16 @@ export default function VynzoraFloatingAssistant() {
                         ? 'bg-slate-800/80 text-slate-400 border-slate-700 hover:text-slate-200'
                         : voiceState === 'listening'
                         ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
+                        : voiceState === 'processing'
+                        ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
                         : voiceState === 'speaking'
                         ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
-                        : voiceState === 'waking'
+                        : voiceState === 'activated'
                         ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40 animate-pulse'
-                        : voiceState === 'followup'
+                        : voiceState === 'conversation'
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 animate-pulse'
+                        : voiceState === 'sleep'
+                        ? 'bg-slate-800 text-slate-400 border-slate-700'
                         : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30 hover:bg-indigo-500/20'
                     }`}
                   >
@@ -1015,13 +1094,17 @@ export default function VynzoraFloatingAssistant() {
                         <span>
                           {voiceState === 'listening'
                             ? 'Listening...'
-                            : voiceState === 'waking'
-                            ? 'Activating...'
+                            : voiceState === 'processing'
+                            ? 'Processing...'
+                            : voiceState === 'activated'
+                            ? 'Activated'
                             : voiceState === 'speaking'
                             ? 'Speaking...'
-                            : voiceState === 'followup'
+                            : voiceState === 'conversation'
                             ? 'Turn-Taking Active'
-                            : 'Say "Hey"'}
+                            : voiceState === 'sleep'
+                            ? 'Sleeping'
+                            : 'Standby: "Hey"'}
                         </span>
                       </>
                     ) : (
@@ -1091,8 +1174,8 @@ export default function VynzoraFloatingAssistant() {
                   <div className="flex items-center gap-2">
                     <Volume2 className="w-4 h-4 text-emerald-400 animate-pulse" />
                     <span className="font-medium text-[11px]">
-                      {voiceState === 'waking'
-                        ? 'Vynzora AI: "Hello! I\'m Vynzora AI. How can I help you?"'
+                      {voiceState === 'activated'
+                        ? 'Vynzora AI: "Hello! I\'m listening. How can I help you?"'
                         : 'Speaking via gTTS...'}
                     </span>
                   </div>
@@ -1132,12 +1215,12 @@ export default function VynzoraFloatingAssistant() {
                         ഹലോ! ഞാൻ വിൻസോറ AI ആണ്. നിങ്ങളുടെ CRM ഡാറ്റ പരിശോധിക്കാനും, കസ്റ്റമർ അന്വേഷണങ്ങൾ കണ്ടെത്താനും, പുതിയ കസ്റ്റമറെ ചേർക്കാനും എനിക്ക് സാധിക്കും.
                       </p>
                       <p className="text-[11px] text-slate-400">
-                        നിങ്ങൾക്ക് ടൈപ്പ് ചെയ്യുകയോ, മൈക്രോഫോൺ അമർത്തുകയോ, അല്ലെങ്കിൽ &quot;Hey&quot; / &quot;Hey Vynzora AI&quot; എന്ന് സംസാരിച്ച് ചോദ്യങ്ങൾ ചോദിക്കുകയോ ചെയ്യാം.
+                        നിങ്ങൾക്ക് ടൈപ്പ് ചെയ്യുകയോ, അല്ലെങ്കിൽ &quot;Hey&quot; / &quot;Hey Vynzora AI&quot; എന്ന് സംസാരിച്ച് ചോദ്യങ്ങൾ ചോദിക്കുകയോ ചെയ്യാം.
                       </p>
                       {isWakeWordEnabled && (
                         <div className="flex items-center gap-2 pt-1 text-[11px] text-indigo-300 font-mono">
                           <Radio className="w-3 h-3 text-indigo-400 animate-pulse" />
-                          <span>Voice Activation Active: Say &quot;Hey&quot; or &quot;Hey Vynzora AI&quot; anytime</span>
+                          <span>Voice Activation: Say &quot;Hey&quot; or &quot;Hey Vynzora AI&quot; to wake up</span>
                         </div>
                       )}
                     </div>
@@ -1201,38 +1284,62 @@ export default function VynzoraFloatingAssistant() {
                   <div className="flex items-center gap-2 p-3.5 rounded-2xl rounded-tl-none bg-slate-900/90 border border-slate-800 text-slate-400 text-xs max-w-[80%]">
                     <RefreshCw className="w-3.5 h-3.5 animate-spin text-brand-400" />
                     <span>
-                      {isRecording ? 'Listening...' : 'Vynzora AI is thinking and querying Supabase...'}
+                      {isRecording
+                        ? 'Listening to your speech...'
+                        : 'Vynzora AI is thinking and querying Supabase...'}
                     </span>
                   </div>
                 )}
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* Recording Status Bar */}
+              {/* Automatic Speech Detection Recording Bar (No Finish Button in Hands-Free Mode) */}
               {isRecording && (
-                <div className="px-4 py-2 bg-rose-950/80 border-t border-rose-500/40 flex items-center justify-between text-xs text-rose-300 animate-pulse">
-                  <div className="flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping" />
-                    <span className="font-semibold">
-                      {voiceState === 'listening' || voiceState === 'followup'
-                        ? 'Listening to your question:'
-                        : 'Recording Voice:'}
-                    </span>
-                    <span className="font-mono">{recordSeconds}s</span>
-                    <span className="text-[10px] text-rose-400">
-                      {voiceState === 'followup' ? '(Say question or "Stop")' : '(Sarvam Saaras v3)'}
-                    </span>
+                <div className="px-4 py-2.5 bg-slate-950/95 border-t border-brand-500/40 flex items-center justify-between text-xs text-brand-200">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
+                    <div className="flex flex-col">
+                      <div className="flex items-center gap-1.5 font-semibold text-white">
+                        <span>
+                          {voiceState === 'conversation'
+                            ? 'Listening for question...'
+                            : 'Listening...'}
+                        </span>
+                        <span className="text-[10px] text-amber-300 font-mono">
+                          (Auto-sends on 1.8s silence)
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-slate-400">
+                        Speak naturally; pause when finished or say &quot;Stop&quot;
+                      </span>
+                    </div>
                   </div>
-                  <button
-                    onClick={stopRecording}
-                    className="px-2.5 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px] cursor-pointer"
-                  >
-                    Finish & Send
-                  </button>
+
+                  {/* Manual click override if user manually initiated recording */}
+                  {isManualRecording ? (
+                    <button
+                      onClick={stopRecording}
+                      className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px] cursor-pointer"
+                    >
+                      Finish & Send
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        stopRecording();
+                        setVoiceState('standby');
+                        startWakeWordListening();
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white text-[10px] cursor-pointer"
+                      title="Cancel listening"
+                    >
+                      Cancel
+                    </button>
+                  )}
                 </div>
               )}
 
-              {/* Input Bar */}
+              {/* Input Bar (Preserved Manual Controls) */}
               <div className="p-3 bg-slate-950 border-t border-slate-800 flex items-center gap-2">
                 <button
                   type="button"
@@ -1243,7 +1350,7 @@ export default function VynzoraFloatingAssistant() {
                       ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/30'
                       : 'bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800'
                   }`}
-                  title={isRecording ? 'Stop recording' : 'Speak in Malayalam, Hindi, or English'}
+                  title={isRecording ? 'Stop recording' : 'Manual microphone record'}
                 >
                   {isRecording ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4 text-brand-400" />}
                 </button>
@@ -1255,11 +1362,11 @@ export default function VynzoraFloatingAssistant() {
                   onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
                   placeholder={
                     isRecording
-                      ? 'Listening to microphone...'
-                      : voiceState === 'waking'
+                      ? 'Listening to microphone (pause when done)...'
+                      : voiceState === 'activated'
                       ? 'Activating Vynzora AI...'
-                      : voiceState === 'followup'
-                      ? 'Listening for follow-up question (or say "Stop")...'
+                      : voiceState === 'conversation'
+                      ? 'Conversation active: ask question, or say "Stop"...'
                       : isWakeWordEnabled
                       ? 'Ask question, or say "Hey" / "Hey Vynzora AI"...'
                       : 'Ask in Malayalam, Hindi, or English...'
