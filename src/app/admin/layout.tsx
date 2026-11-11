@@ -6,6 +6,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import AdminSidebar from '@/components/layout/AdminSidebar';
 import { getStoredAdmin } from '@/lib/auth';
 import RealtimeNotificationPopup from '@/components/notifications/RealtimeNotificationPopup';
+import VynzoraFloatingAssistant from '@/components/ai/VynzoraFloatingAssistant';
 import { Sparkles, Globe, ArrowLeft, Shield, Bell } from 'lucide-react';
 
 export default function AdminLayout({
@@ -91,6 +92,7 @@ export default function AdminLayout({
         <main className="flex-1 overflow-y-auto p-4 sm:p-8 lg:p-10">
           <RealtimeNotificationPopup />
           {children}
+          <VynzoraFloatingAssistant />
         </main>
       </div>
     </div>
