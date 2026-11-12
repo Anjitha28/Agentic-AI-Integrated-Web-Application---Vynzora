@@ -100,10 +100,14 @@ export function normalizeSpeechText(raw: string): string {
 
 /**
  * Robust, low-latency wake-word matcher:
- * - Accepts "Hey Vynzora AI", "Hey Zora AI", "Vynzora AI", "Zora AI", "Hey Vynzora", "Hey Zora" (and Malayalam/Hindi equivalents).
+ * - Accepts any of the 3 supported wake phrases:
+ *   1. "Hey Vynzora AI"
+ *   2. "Vynzora AI"
+ *   3. "Hey"
+ *   (and variations: "Hey Vyn Zora AI", "Hey Zora AI", "Zora AI", "vynzora", and Malayalam/Hindi equivalents).
  * - Handles accent variations, capitalization, and punctuation.
  * - Explicitly rejects "Hey Siri", "Siri", "Alexa", "Google".
- * - Does NOT trigger on standalone "Hey".
+ * - Ordinary unrelated speech does not activate the assistant.
  */
 export function matchWakeWord(rawTranscript: string): {
   matched: boolean;
@@ -119,16 +123,20 @@ export function matchWakeWord(rawTranscript: string): {
   }
 
   // English target patterns (with word boundaries)
-  const wakePattern = /\b(hey\s+vynzora\s+ai|hey\s+zora\s+ai|vynzora\s+ai|zora\s+ai|hey\s+vynzora|hey\s+zora)\b/i;
+  // Matches "hey vynzora ai", "hey zora ai", "vynzora ai", "zora ai", "hey vynzora", "hey zora", "vynzora", or standalone "hey"
+  const wakePattern = /\b(hey\s+vynzora\s+ai|hey\s+zora\s+ai|vynzora\s+ai|zora\s+ai|hey\s+vynzora|hey\s+zora|vynzora|\bhey\b)\b/i;
   // Indic script pattern (Malayalam & Hindi, without ASCII word boundaries)
-  const mlHiPattern = /(?:^|\s)(വിൻസോറ(\s*ai)?|ഹേയ്\s*വിൻസോറ|ഹേയ്\s*സോറ|സോറ(\s*ai)?|हाय\s*विन्ज़ोरा|हाय\s*ज़ोरा|विन्ज़ोरा(\s*ai)?|ज़ोरा(\s*ai)?)(?:$|\s)/i;
+  const mlHiPattern = /(?:^|\s)(വിൻസോറ(\s*ai)?|ഹേയ്\s*വിൻസോറ|ഹേയ്\s*സോറ|ഹേയ്|സോറ(\s*ai)?|हाय\s*विन्ज़ोरा|हाय\s*ज़ोरा|विन्ज़ोरा(\s*ai)?|ज़ोरा(\s*ai)?|हाय)(?:$|\s)/i;
 
   let match = normalized.match(wakePattern);
   if (!match) {
     const padded = ` ${normalized} `;
     const mlMatch = padded.match(mlHiPattern);
     if (mlMatch) {
-      return { matched: true, phrase: mlMatch[1], trailingQuery: '', normalized };
+      const phrase = mlMatch[1];
+      const idx = normalized.indexOf(phrase);
+      const trailingQuery = idx >= 0 ? normalized.slice(idx + phrase.length).trim() : '';
+      return { matched: true, phrase, trailingQuery, normalized };
     }
   } else if (match && match.index !== undefined) {
     const phrase = match[0];
@@ -455,7 +463,7 @@ export default function VynzoraFloatingAssistant() {
     const sleepMsg: ChatMessage = {
       id: `assistant-sleep-${Date.now()}`,
       role: 'assistant',
-      content: "Going to sleep. Say 'Hey Vynzora AI' or 'Hey Zora AI' whenever you need me.",
+      content: "Going to sleep. Say 'Hey Vynzora AI', 'Vynzora AI', or 'Hey' whenever you need me.",
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
 
@@ -469,7 +477,7 @@ export default function VynzoraFloatingAssistant() {
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       const utter = new SpeechSynthesisUtterance(
-        "Going to sleep. Say 'Hey Vynzora AI' or 'Hey Zora AI' whenever you need me."
+        "Going to sleep. Say 'Hey Vynzora AI', 'Vynzora AI', or 'Hey' whenever you need me."
       );
       utter.rate = 1.0;
       utter.onend = returnToStandby;
@@ -1057,7 +1065,7 @@ export default function VynzoraFloatingAssistant() {
       setVoiceState('WAKE_WORD_STANDBY');
       voiceStateRef.current = 'WAKE_WORD_STANDBY';
       console.log(
-        '[Vynzora Diagnostic] Wake-word detection active in standby (listening for "Hey Vynzora AI" / "Hey Zora AI")'
+        '[Vynzora Diagnostic] Wake-word detection active in standby (listening for "Hey Vynzora AI", "Vynzora AI", or "Hey")'
       );
     } catch (err: any) {
       console.warn('[Vynzora Diagnostic] Could not initialize wake-word recognition:', err.message || err);
@@ -1222,7 +1230,7 @@ export default function VynzoraFloatingAssistant() {
           onClick={requestMicPermissionManually}
           type="button"
           className="fixed bottom-28 right-6 z-50 px-3.5 py-2 rounded-2xl bg-slate-900/95 border border-brand-500/50 text-brand-200 text-xs shadow-2xl flex items-center gap-2 hover:bg-slate-800 transition-all cursor-pointer animate-bounce backdrop-blur-md"
-          title="Click to enable automatic 'Hey Vynzora AI' hands-free voice detection"
+          title="Click to enable automatic 'Hey Vynzora AI' / 'Vynzora AI' / 'Hey' hands-free voice detection"
         >
           <div className="w-2 h-2 rounded-full bg-brand-400 animate-ping" />
           <Mic className="w-3.5 h-3.5 text-brand-400" />
@@ -1290,7 +1298,7 @@ export default function VynzoraFloatingAssistant() {
                     ? 'Speaking response...'
                     : voiceState === 'CONTINUOUS_LISTENING'
                     ? 'Active (Ask next question)'
-                    : 'Say "Hey Vynzora AI"'}
+                    : 'Say "Hey" or "Hey Vynzora AI"'}
                 </span>
               </div>
             )}
@@ -1339,7 +1347,7 @@ export default function VynzoraFloatingAssistant() {
                     type="button"
                     title={
                       isWakeWordEnabled
-                        ? 'Hands-Free "Hey Vynzora AI" / "Hey Zora AI" is active. Click to disable.'
+                        ? 'Hands-Free "Hey" / "Hey Vynzora AI" / "Vynzora AI" is active. Click to disable.'
                         : 'Hands-Free is off. Click to enable wake words.'
                     }
                     className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-mono border transition-all cursor-pointer ${
@@ -1492,12 +1500,12 @@ export default function VynzoraFloatingAssistant() {
                         ഹലോ! ഞാൻ വിൻസോറ AI ആണ്. നിങ്ങളുടെ CRM ഡാറ്റ പരിശോധിക്കാനും, കസ്റ്റമർ അന്വേഷണങ്ങൾ കണ്ടെത്താനും, പുതിയ കസ്റ്റമറെ ചേർക്കാനും എനിക്ക് സാധിക്കും.
                       </p>
                       <p className="text-[11px] text-slate-400">
-                        നിങ്ങൾക്ക് ടൈപ്പ് ചെയ്യുകയോ, അല്ലെങ്കിൽ &quot;Hey Vynzora AI&quot; / &quot;Hey Zora AI&quot; എന്ന് സംസാരിച്ച് ചോദ്യങ്ങൾ ചോദിക്കുകയോ ചെയ്യാം.
+                        നിങ്ങൾക്ക് ടൈപ്പ് ചെയ്യുകയോ, അല്ലെങ്കിൽ &quot;Hey Vynzora AI&quot;, &quot;Vynzora AI&quot;, അല്ലെങ്കിൽ &quot;Hey&quot; എന്ന് സംസാരിച്ച് ചോദ്യങ്ങൾ ചോദിക്കുകയോ ചെയ്യാം.
                       </p>
                       {isWakeWordEnabled && (
                         <div className="flex items-center gap-2 pt-1 text-[11px] text-indigo-300 font-mono">
                           <Radio className="w-3 h-3 text-indigo-400 animate-pulse" />
-                          <span>Voice Activation: Say &quot;Hey Vynzora AI&quot; or &quot;Hey Zora AI&quot; to wake up</span>
+                          <span>Voice Activation: Say &quot;Hey Vynzora AI&quot;, &quot;Vynzora AI&quot;, or &quot;Hey&quot; to wake up</span>
                         </div>
                       )}
                     </div>
@@ -1664,7 +1672,7 @@ export default function VynzoraFloatingAssistant() {
                       ? 'Processing question & querying database...'
                       : voiceState === 'SPEAKING'
                       ? 'Speaking AI response (Click to stop)'
-                      : 'Standby: Say "Hey Vynzora AI" or click to speak'
+                      : 'Standby: Say "Hey", "Hey Vynzora AI", or "Vynzora AI" (or click to speak)'
                   }
                 >
                   {voiceState === 'SPEECH_DETECTED' ? (
@@ -1697,7 +1705,7 @@ export default function VynzoraFloatingAssistant() {
                       : voiceState === 'CONTINUOUS_LISTENING'
                       ? 'Conversation active: ask question, or say "Stop"...'
                       : isWakeWordEnabled
-                      ? 'Ask question, or say "Hey Vynzora AI" / "Hey Zora AI"...'
+                      ? 'Ask question, or say "Hey", "Hey Vynzora AI", or "Vynzora AI"...'
                       : 'Ask in Malayalam, Hindi, or English...'
                   }
                   disabled={isLoading || isRecording}
