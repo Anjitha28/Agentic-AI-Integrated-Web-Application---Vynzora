@@ -96,14 +96,20 @@ export function normalizeSpeechText(raw: string): string {
   text = text.replace(/\ba\s+i\b/g, 'ai');
   text = text.replace(/\b(eye|aye)\b/g, 'ai');
 
-  // 3. Normalize greeting prefix variations (hay, ay, ey, he, eh) -> hey
+  // 3. Normalize compound / single-word variations
+  text = text.replace(/\b(heyzora|hezora|hazora|ayzora)\b/g, 'hey zora');
+
+  // 4. Normalize greeting prefix variations before zora (hay, ay, ey, he, eh, a, hi, high) -> hey
+  text = text.replace(/\b(hay|ay|ey|he|eh|a|hi|high)\b(?=\s*(zora|zorah|zoro|sora|zara|zura|zola|zoya|jora|xora|czora|torah))/g, 'hey');
+
+  // Also standalone prefix variation replacement
   text = text.replace(/\b(hay|ay|ey|he|eh)\b/g, 'hey');
 
-  // 4. Normalize phonetic variations of zora:
+  // 5. Normalize phonetic variations of zora:
   // zorah, zoro, sora, zara, zura, zola, zoya, jora, xora, czora, torah
   text = text.replace(/\b(zorah|zoro|sora|zara|zura|zola|zoya|jora|xora|czora|torah?)\b/g, 'zora');
 
-  // 5. Collapse consecutive whitespace
+  // 6. Collapse consecutive whitespace
   text = text.replace(/\s+/g, ' ').trim();
   return text;
 }
@@ -1043,6 +1049,14 @@ export default function VynzoraFloatingAssistant() {
         console.log(`[Vynzora Diagnostic] Transcript generated: "${data.transcript}" (Language: ${data.detected_language})`);
         console.log(`[Vynzora Diagnostic] AI response received: "${data.response.slice(0, 100)}..."`);
 
+        // Check if user spoke the wake word ("Hey Zora")
+        const wakeCheck = matchWakeWord(data.transcript);
+        if (wakeCheck.matched) {
+          console.log(`[Vynzora Diagnostic] Wake word detected in voice recording: "${data.transcript}"`);
+          handleWakeWordTriggered(data.transcript);
+          return;
+        }
+
         // Check if user spoke a sleep command ("Stop" / "Go to sleep")
         if (SLEEP_WORD_REGEX.test(data.transcript.trim())) {
           playSleepResponse();
@@ -1236,21 +1250,20 @@ export default function VynzoraFloatingAssistant() {
 
         mediaRecorder.onstop = async () => {
           cleanupVAD();
-          // If in hands-free mode and no genuine human speech was confirmed, recycle buffer without submitting empty audio
+          // If in hands-free mode and no genuine human speech was confirmed, return to standby wake-word listening
           if (!hasSpokenRef.current && isHandsFree) {
             console.log(
-              '[Vynzora Diagnostic] No genuine user speech in recording buffer; recycling continuous listening session'
+              '[Vynzora Diagnostic] No user speech detected; returning assistant to standby wake-word listening'
             );
             audioChunksRef.current = [];
             isRecordingRef.current = false;
             setIsRecording(false);
-            if (
-              isWakeWordEnabledRef.current &&
-              (voiceStateRef.current === 'CONTINUOUS_LISTENING' || voiceStateRef.current === 'LISTENING')
-            ) {
+            if (isWakeWordEnabledRef.current) {
+              setVoiceState('WAKE_WORD_STANDBY');
+              voiceStateRef.current = 'WAKE_WORD_STANDBY';
               setTimeout(() => {
-                startRecordingRef.current?.(true);
-              }, 150);
+                startWakeWordListeningRef.current?.();
+              }, 100);
             }
             return;
           }
@@ -1408,7 +1421,7 @@ export default function VynzoraFloatingAssistant() {
       rec.continuous = true;
       rec.interimResults = true;
       rec.maxAlternatives = 3; // Inspect top 3 speech recognition alternatives for accents
-      rec.lang = currentLanguageRef.current || 'en-US';
+      rec.lang = 'en-US'; // ALWAYS 'en-US' for "Hey Zora" wake-word recognition
 
       timingRef.current.wakeListenStartedAt = performance.now();
 
@@ -1629,6 +1642,10 @@ export default function VynzoraFloatingAssistant() {
         if (e.error !== 'no-speech' && e.error !== 'aborted') {
           console.warn('[Vynzora Diagnostic] Wake word listener status/error:', e.error);
         }
+        if (e.error === 'not-allowed') {
+          console.warn('[Vynzora Diagnostic] SpeechRecognition microphone access denied by user');
+          setMicPermission('denied');
+        }
       };
 
       rec.onend = () => {
@@ -1637,20 +1654,18 @@ export default function VynzoraFloatingAssistant() {
         if (
           isWakeWordEnabledRef.current &&
           !isRecordingRef.current &&
-          !isLoadingRef.current &&
-          (voiceStateRef.current === 'WAKE_WORD_STANDBY' || voiceStateRef.current === 'SPEAKING')
+          !isLoadingRef.current
         ) {
           setTimeout(() => {
             if (
               isWakeWordEnabledRef.current &&
               !isRecordingRef.current &&
-              !isLoadingRef.current &&
-              (voiceStateRef.current === 'WAKE_WORD_STANDBY' || voiceStateRef.current === 'SPEAKING')
+              !isLoadingRef.current
             ) {
               console.log('[Vynzora Diagnostic] SpeechRecognition ended, restarting fresh listener instance...');
               startWakeWordListeningRef.current?.();
             }
-          }, 150);
+          }, 100);
         }
       };
 
@@ -1674,10 +1689,20 @@ export default function VynzoraFloatingAssistant() {
     if (typeof window === 'undefined') return;
 
     let mounted = true;
-    setVoiceState('INITIALIZING');
-    voiceStateRef.current = 'INITIALIZING';
+    setVoiceState('WAKE_WORD_STANDBY');
+    voiceStateRef.current = 'WAKE_WORD_STANDBY';
     console.log('[Vynzora Diagnostic] Assistant initializing on Admin Page load');
 
+    // 1. Immediately start hands-free wake-word detection on page load!
+    // Web Speech API initializes independently and starts listening for "Hey Zora" immediately.
+    setTimeout(() => {
+      if (mounted && isWakeWordEnabledRef.current) {
+        console.log('[Vynzora Diagnostic] Launching immediate wake-word detection on mount...');
+        startWakeWordListeningRef.current?.();
+      }
+    }, 50);
+
+    // 2. Pre-cache microphone MediaStream in background for audio recording & VAD
     const initMicrophoneOnLoad = async () => {
       try {
         if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
@@ -1696,25 +1721,23 @@ export default function VynzoraFloatingAssistant() {
             setMicPermission('granted');
             setVoiceState('WAKE_WORD_STANDBY');
             voiceStateRef.current = 'WAKE_WORD_STANDBY';
-            startWakeWordListeningRef.current?.();
+            if (!wakeWordRecRef.current && isWakeWordEnabledRef.current) {
+              startWakeWordListeningRef.current?.();
+            }
           }
           return;
         }
       } catch (err: any) {
         console.log(
-          '[Vynzora Diagnostic] Microphone permission deferred or requires user gesture:',
+          '[Vynzora Diagnostic] MediaStream pre-cache deferred or requires user gesture:',
           err.message || err
         );
         if (mounted) {
-          if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-            console.warn('[Vynzora Diagnostic] Microphone permission denied');
-            setMicPermission('denied');
-          } else {
-            setMicPermission('prompt');
-          }
+          // If already listening via SpeechRecognition, keep prompt state
+          setMicPermission('prompt');
         }
 
-        // Gesture fallback: activate seamlessly on first user interaction anywhere
+        // Gesture fallback: activate stream seamlessly on first user interaction anywhere
         const onFirstInteraction = async () => {
           window.removeEventListener('click', onFirstInteraction);
           window.removeEventListener('keydown', onFirstInteraction);
@@ -1734,13 +1757,12 @@ export default function VynzoraFloatingAssistant() {
               setMicPermission('granted');
               setVoiceState('WAKE_WORD_STANDBY');
               voiceStateRef.current = 'WAKE_WORD_STANDBY';
-              startWakeWordListeningRef.current?.();
+              if (!wakeWordRecRef.current && isWakeWordEnabledRef.current) {
+                startWakeWordListeningRef.current?.();
+              }
             }
           } catch (e: any) {
-            if (mounted && (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError')) {
-              console.warn('[Vynzora Diagnostic] Microphone permission denied');
-              setMicPermission('denied');
-            }
+            // Keep prompt state
           }
         };
 
