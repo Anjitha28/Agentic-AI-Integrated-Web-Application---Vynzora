@@ -35,7 +35,7 @@ export interface ChatMessage {
   isVoiceInput?: boolean;
 }
 
-// 10 Distinct Lifecycle States Supporting Real-Time Interruption (Barge-In)
+// 12 Distinct Lifecycle States Supporting Two-Stage Real-Time Interruption (Barge-In)
 export type AssistantVoiceState =
   | 'INITIALIZING' // 1. Initializing microphone and wake-word detector on page load
   | 'WAKE_WORD_STANDBY' // 2. Standby: Waiting for ONLY "Hey Zora"
@@ -43,10 +43,12 @@ export type AssistantVoiceState =
   | 'LISTENING' // 4. Listening: Capturing user's question hands-free
   | 'USER_SPEAKING' // 5. User Speaking: User is actively speaking
   | 'SPEECH_DETECTED' // Alias for USER_SPEAKING
-  | 'PROCESSING' // 6. Processing: Submitting audio to Sarvam STT -> Gemini -> gTTS
-  | 'SPEAKING' // 7. Speaking: Playing AI voice response (interruptible in real-time)
-  | 'INTERRUPTED' // 8. Interrupted: User spoke during AI speech; audio halted immediately
-  | 'CONTINUOUS_LISTENING' // 9. Continuous Listening: Turn-taking active, hands-free
+  | 'USER_SPEECH_CANDIDATE' // 6. Stage A: Speech candidate detected during TTS; audio continues playing!
+  | 'USER_SPEECH_CONFIRMED' // 7. Stage B: Genuine speech confirmed; halts TTS immediately!
+  | 'PROCESSING' // 8. Processing: Submitting audio to Sarvam STT -> Gemini -> gTTS
+  | 'SPEAKING' // 9. Speaking: Playing AI voice response (interruptible in real-time)
+  | 'INTERRUPTED' // 10. Interrupted: User spoke during AI speech; audio halted immediately
+  | 'CONTINUOUS_LISTENING' // 11. Continuous Listening: Turn-taking active, hands-free
   | 'DISABLED'; // Voice activation explicitly turned off by user
 
 // Natural Speech Detection Parameters
@@ -165,7 +167,8 @@ export function matchWakeWord(rawTranscript: string): {
 /**
  * Detects whether incoming microphone transcription is self-echo from the
  * assistant's own TTS voice output playing through the room/laptop speakers.
- * Prevents the assistant from prematurely cutting itself off.
+ * Prevents the assistant from prematurely cutting itself off, while never
+ * blocking genuine user speech, questions, or command words.
  */
 export function isSelfEcho(incomingRaw: string, assistantSpokenText: string): boolean {
   if (!incomingRaw || !assistantSpokenText) return false;
@@ -173,12 +176,20 @@ export function isSelfEcho(incomingRaw: string, assistantSpokenText: string): bo
   const ttsNorm = normalizeSpeechText(assistantSpokenText);
   if (!incNorm || !ttsNorm) return false;
 
-  // 1. Direct exact or substring inclusion
+  // Distinct user intent / conversational command tokens that indicate a human speaker:
+  // An echo from laptop speakers will never contain new user action verbs or command words!
+  const USER_INTENT_PATTERN =
+    /\b(wait|stop|listen|cancel|hello|help|pause|hold|show|tell|give|what|how|why|when|where|who|which|explain|details|more|new|add|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|പറയൂ|കാണിക്കൂ|എനിക്ക്|നൽകൂ|വിവരങ്ങൾ|ചോദിക്കൂ|പുതിയ|രുക്കോ|रुको|सुनो|बताओ|दिखाइए|दिखाओ|नया|दीजिए)\b/i;
+  if (USER_INTENT_PATTERN.test(incNorm)) {
+    return false;
+  }
+
+  // 1. Direct exact or contiguous substring inclusion from assistant speech
   if (ttsNorm.includes(incNorm)) {
     return true;
   }
 
-  // 2. Word-level overlap: if the incoming words mostly match the assistant's speech
+  // 2. High contiguous token overlap (>= 80% matching with at least 2 words and no user intent)
   const incWords = incNorm.split(/\s+/).filter((w) => w.length > 2);
   if (incWords.length === 0) return false;
 
@@ -191,8 +202,7 @@ export function isSelfEcho(incomingRaw: string, assistantSpokenText: string): bo
   }
 
   const overlapRatio = matchCount / incWords.length;
-  // If 70% or more of the words heard by the mic are words from the assistant's current utterance
-  if (overlapRatio >= 0.70) {
+  if (overlapRatio >= 0.80 && incWords.length >= 2) {
     return true;
   }
 
@@ -239,14 +249,21 @@ export default function VynzoraFloatingAssistant() {
   const firstGreetingAudioRef = useRef<HTMLAudioElement | null>(null); // Preloaded "Hello! I'm Zora..."
   const ackGreetingAudioRef = useRef<HTMLAudioElement | null>(null); // Preloaded "Yes, I'm listening!..."
 
-  // Request Tracking & Real-Time Barge-In Invalidation
+  // Request Tracking, Conversation Lifecycle & Real-Time Barge-In Invalidation
+  const isConversationActiveRef = useRef<boolean>(false);
   const currentRequestIdRef = useRef<number>(0);
   const hasHadFirstActivationRef = useRef<boolean>(false);
   const interruptionVadIntervalRef = useRef<any>(null);
+  const candidateTimeoutRef = useRef<any>(null);
+  const bargeInRecRef = useRef<any>(null);
   const startRecordingRef = useRef<((isHandsFree?: boolean) => Promise<void>) | undefined>(undefined);
   const stopRecordingRef = useRef<(() => void) | undefined>(undefined);
   const startWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
   const stopWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
+  const startBargeInListeningRef = useRef<(() => void) | undefined>(undefined);
+  const stopBargeInListeningRef = useRef<(() => void) | undefined>(undefined);
+  const handleWakeWordTriggeredRef = useRef<((text: string) => void) | undefined>(undefined);
+  const playSleepResponseRef = useRef<(() => void) | undefined>(undefined);
   const activeAbortControllerRef = useRef<AbortController | null>(null);
   const currentLanguageRef = useRef<string>('en-US');
   const handleSendMessageRef = useRef<((text?: string) => Promise<void>) | undefined>(undefined);
@@ -379,12 +396,20 @@ export default function VynzoraFloatingAssistant() {
       if (interruptionVadIntervalRef.current) {
         clearInterval(interruptionVadIntervalRef.current);
       }
+      if (candidateTimeoutRef.current) {
+        clearTimeout(candidateTimeoutRef.current);
+      }
       if (interimInterruptionTimerRef.current) {
         clearTimeout(interimInterruptionTimerRef.current);
       }
       if (wakeWordRecRef.current) {
         try {
           wakeWordRecRef.current.abort();
+        } catch {}
+      }
+      if (bargeInRecRef.current) {
+        try {
+          bargeInRecRef.current.abort();
         } catch {}
       }
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -409,8 +434,24 @@ export default function VynzoraFloatingAssistant() {
     }
   }, []);
 
+  const stopBargeInListening = useCallback(() => {
+    if (bargeInRecRef.current) {
+      try {
+        bargeInRecRef.current.abort();
+      } catch {}
+      bargeInRecRef.current = null;
+      console.log('[Vynzora Diagnostic] Barge-in speech recognition stopped');
+    }
+  }, []);
+  stopBargeInListeningRef.current = stopBargeInListening;
+
   const stopAudio = useCallback(() => {
     cleanupInterruptionVAD();
+    stopBargeInListening();
+    if (candidateTimeoutRef.current) {
+      clearTimeout(candidateTimeoutRef.current);
+      candidateTimeoutRef.current = null;
+    }
     if (interimInterruptionTimerRef.current) {
       clearTimeout(interimInterruptionTimerRef.current);
       interimInterruptionTimerRef.current = null;
@@ -430,7 +471,7 @@ export default function VynzoraFloatingAssistant() {
     }
     isPlayingAudioRef.current = false;
     setIsPlayingAudio(false);
-  }, [cleanupInterruptionVAD]);
+  }, [cleanupInterruptionVAD, stopBargeInListening]);
 
   // Real-Time Barge-In Voice Interruption (Highest Priority)
   // Immediately stops current TTS playback, cancels remaining audio,
@@ -451,7 +492,7 @@ export default function VynzoraFloatingAssistant() {
       // 2. Invalidate current and pending AI requests so stale responses never play
       currentRequestIdRef.current++;
 
-      // 3. Immediately stop and reset audio playback
+      // 3. Immediately stop and reset audio playback & barge-in
       stopAudio();
 
       // 4. Send cancellation notification to backend in background
@@ -464,13 +505,13 @@ export default function VynzoraFloatingAssistant() {
         }).catch(() => {});
       }
 
-      setVoiceState('INTERRUPTED');
-      voiceStateRef.current = 'INTERRUPTED';
+      setVoiceState('USER_SPEECH_CONFIRMED');
+      voiceStateRef.current = 'USER_SPEECH_CONFIRMED';
 
       // 5. If user spoke a complete question during interruption, process it immediately!
       // Do not make the user repeat their question!
       const trimmedText = capturedText ? capturedText.trim() : '';
-      const isInterjection = /^(wait|hold\s+on|listen|pause|hello|നിൽക്കൂ|കേൾക്കൂ|ശരി|ശരി\s+മതി|മതി|रुको|सुनो)$/i.test(trimmedText);
+      const isInterjection = /^(wait|hold\s+on|listen|pause|hello|help|cancel|നിൽക്കൂ|കേൾക്കൂ|ശരി|ശരി\s+മതി|മതി|रुको|सुनो)$/i.test(trimmedText);
       if (trimmedText && trimmedText.length >= 4 && !isInterjection) {
         console.log(`[Vynzora Diagnostic] Captured user interruption question directly: "${trimmedText}"`);
         if (handleSendMessageRef.current) {
@@ -480,6 +521,8 @@ export default function VynzoraFloatingAssistant() {
       }
 
       // 6. Otherwise immediately activate microphone hands-free to capture ongoing speech
+      setVoiceState('LISTENING');
+      voiceStateRef.current = 'LISTENING';
       setTimeout(() => {
         if (isWakeWordEnabledRef.current) {
           startRecordingRef.current?.(true);
@@ -535,11 +578,10 @@ export default function VynzoraFloatingAssistant() {
           const voiceBandAvg = voiceBandSum / 34;
           const voiceBandRatio = voiceBandAvg / (avgTotal || 1);
 
-          // 3. Track ambient noise floor (clamped below speech levels so speaker audio doesn't inflate baseline)
+          // 3. Track ambient noise floor (clamped below speech levels)
           if (avgTotal < ambientNoiseFloor) {
             ambientNoiseFloor = ambientNoiseFloor * 0.85 + avgTotal * 0.15;
           } else if (avgTotal < 22) {
-            // Only drift noise floor when audio is genuinely low ambient background
             ambientNoiseFloor = ambientNoiseFloor * 0.98 + avgTotal * 0.02;
           }
 
@@ -547,7 +589,6 @@ export default function VynzoraFloatingAssistant() {
           const snr = Math.max(0, avgTotal - ambientNoiseFloor);
 
           // 5. Genuine human speech profile:
-          // User speaking into mic creates loud voice energy in vocal band
           const isHumanVocal =
             avgTotal >= MIN_BARGE_IN_RMS &&
             snr >= MIN_BARGE_IN_SNR_DB &&
@@ -555,15 +596,27 @@ export default function VynzoraFloatingAssistant() {
 
           if (isHumanVocal) {
             sustainedVoiceMs += 50;
-            // If sustained loud human voice into microphone for >= 350ms during playback:
-            // Immediate acoustic barge-in trigger!
-            if (sustainedVoiceMs >= MIN_BARGE_IN_SPEECH_DURATION_MS) {
-              console.log(
-                `[Vynzora Diagnostic] Acoustic human voice confirmed during playback (RMS: ${Math.round(avgTotal)}, SNR: ${Math.round(snr)}dB, Ratio: ${Math.round(voiceBandRatio * 100)}%)! Interrupting.`
-              );
-              cleanupInterruptionVAD();
-              interruptPlayback('acoustic human voice barge-in');
-              return;
+            // STAGE A (USER_SPEECH_CANDIDATE):
+            // Acoustic speech candidate detected during TTS playback.
+            // DO NOT stop TTS playback! Audio continues playing.
+            if (sustainedVoiceMs >= 150) {
+              if (voiceStateRef.current === 'SPEAKING') {
+                console.log(
+                  `[Vynzora Diagnostic] Stage A (Candidate): Acoustic vocal energy detected (RMS: ${Math.round(
+                    avgTotal
+                  )}, SNR: ${Math.round(snr)}dB). TTS continues playing.`
+                );
+                setVoiceState('USER_SPEECH_CANDIDATE');
+                voiceStateRef.current = 'USER_SPEECH_CANDIDATE';
+              }
+              if (candidateTimeoutRef.current) clearTimeout(candidateTimeoutRef.current);
+              candidateTimeoutRef.current = setTimeout(() => {
+                if (voiceStateRef.current === 'USER_SPEECH_CANDIDATE') {
+                  console.log('[Vynzora Diagnostic] Acoustic candidate unverified; reverting to SPEAKING.');
+                  setVoiceState('SPEAKING');
+                  voiceStateRef.current = 'SPEAKING';
+                }
+              }, 900);
             }
           } else {
             sustainedVoiceMs = Math.max(0, sustainedVoiceMs - 35);
@@ -581,13 +634,181 @@ export default function VynzoraFloatingAssistant() {
         console.warn('[Vynzora Diagnostic] Could not setup interruption VAD:', e.message || e);
       }
     },
-    [cleanupInterruptionVAD, interruptPlayback]
+    [cleanupInterruptionVAD]
   );
+
+  // Dedicated Real-Time Barge-In Speech Recognizer (Two-Stage Interruption Engine)
+  const startBargeInListening = useCallback(() => {
+    if (!isWakeWordEnabledRef.current || !isPlayingAudioRef.current) return;
+    if (typeof window === 'undefined') return;
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    try {
+      if (bargeInRecRef.current) {
+        try {
+          bargeInRecRef.current.abort();
+        } catch {}
+        bargeInRecRef.current = null;
+      }
+      if (wakeWordRecRef.current) {
+        try {
+          wakeWordRecRef.current.abort();
+        } catch {}
+        wakeWordRecRef.current = null;
+      }
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 3;
+      rec.lang = 'en-US';
+
+      rec.onresult = (event: any) => {
+        if (!isPlayingAudioRef.current) return;
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          for (let a = 0; a < event.results[i].length; a++) {
+            const rawTranscript = event.results[i][a].transcript;
+            const confidence = event.results[i][a].confidence;
+            if (!rawTranscript || !rawTranscript.trim()) continue;
+
+            const trimmed = rawTranscript.trim();
+            const isFinal = event.results[i].isFinal;
+
+            // 1. Filter out speaker self-echo (assistant's own TTS playing in the room)
+            if (isSelfEcho(trimmed, currentAssistantSpeechTextRef.current)) {
+              console.log(`[Vynzora Diagnostic] Discarding speaker self-echo: "${trimmed}"`);
+              continue;
+            }
+
+            // 2. STAGE A (USER_SPEECH_CANDIDATE):
+            // Speech hypothesis recognized while assistant is speaking.
+            // DO NOT stop TTS playback! Audio continues playing.
+            if (voiceStateRef.current === 'SPEAKING') {
+              console.log(
+                `[Vynzora Diagnostic] Stage A (Candidate): Hypothesis "${trimmed}". TTS continues playing.`
+              );
+              setVoiceState('USER_SPEECH_CANDIDATE');
+              voiceStateRef.current = 'USER_SPEECH_CANDIDATE';
+            }
+            if (candidateTimeoutRef.current) clearTimeout(candidateTimeoutRef.current);
+            candidateTimeoutRef.current = setTimeout(() => {
+              if (voiceStateRef.current === 'USER_SPEECH_CANDIDATE') {
+                console.log('[Vynzora Diagnostic] Candidate expired without confirmation; reverting to SPEAKING');
+                setVoiceState('SPEAKING');
+                voiceStateRef.current = 'SPEAKING';
+              }
+            }, 900);
+
+            // 3. Wake Word Check ("Hey Zora" / "Hey Zorah") -> Confirmed Barge-In
+            const wakeCheck = matchWakeWord(trimmed);
+            if (wakeCheck.matched) {
+              console.log(`[Vynzora Diagnostic] Stage B (Confirmed): "Hey Zora" spoken during playback!`);
+              stopBargeInListening();
+              if (handleWakeWordTriggeredRef.current) {
+                handleWakeWordTriggeredRef.current(trimmed);
+              }
+              return;
+            }
+
+            // 4. Sleep Command Check ("Stop", "Sleep", "Cancel", "മതി", "रुको")
+            if (SLEEP_WORD_REGEX.test(trimmed)) {
+              console.log(`[Vynzora Diagnostic] Stage B (Confirmed): Sleep command spoken during playback: "${trimmed}"`);
+              stopBargeInListening();
+              if (playSleepResponseRef.current) {
+                playSleepResponseRef.current();
+              }
+              return;
+            }
+
+            // 5. Single-word command support (e.g. "wait", "stop", "listen", "pause", "hello", "help", "cancel", "നിൽക്കൂ", "കേൾക്കൂ", "ശരി", "മതി", "ശരി മതി", "रुको", "सुनो")
+            const isCommandWord = /^(wait|stop|listen|cancel|hello|help|pause|hold\s*on|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|रुको|सुनो)$/i.test(
+              trimmed
+            );
+
+            const words = trimmed.split(/\s+/).filter(Boolean);
+
+            // Stage B Confirmation Criteria:
+            // - Clear command word (confidence undefined or >= 0.55)
+            // - OR multi-word speech (>= 2 valid words) with confidence >= 0.60
+            // - OR final recognized utterance >= 4 chars with confidence >= 0.65
+            let isConfirmed = false;
+            if (isCommandWord) {
+              if (confidence === undefined || confidence >= 0.55) {
+                isConfirmed = true;
+              }
+            } else if (words.length >= 2) {
+              if (confidence === undefined || confidence >= 0.60) {
+                isConfirmed = true;
+              }
+            } else if (isFinal && trimmed.length >= 4) {
+              if (confidence === undefined || confidence >= 0.65) {
+                isConfirmed = true;
+              }
+            }
+
+            if (!isConfirmed) {
+              // Not yet verified; TTS continues playing
+              continue;
+            }
+
+            // STAGE B CONFIRMED: Genuine intelligible user speech confirmed!
+            console.log(
+              `[Vynzora Diagnostic] Stage B (Confirmed): Genuine human speech verified: "${trimmed}" (confidence: ${
+                confidence ?? 'N/A'
+              }, isFinal: ${isFinal}). Halting playback!`
+            );
+
+            if (candidateTimeoutRef.current) {
+              clearTimeout(candidateTimeoutRef.current);
+              candidateTimeoutRef.current = null;
+            }
+
+            stopBargeInListening();
+            interruptPlayback('confirmed human voice barge-in', trimmed);
+            return;
+          }
+        }
+      };
+
+      rec.onerror = (e: any) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('[Vynzora Diagnostic] Barge-in speech recognition status:', e.error);
+        }
+      };
+
+      rec.onend = () => {
+        bargeInRecRef.current = null;
+        if (isPlayingAudioRef.current) {
+          setTimeout(() => {
+            if (isPlayingAudioRef.current) {
+              startBargeInListeningRef.current?.();
+            }
+          }, 80);
+        }
+      };
+
+      rec.start();
+      bargeInRecRef.current = rec;
+      console.log('[Vynzora Diagnostic] Barge-in speech listener active (Two-Stage Interruption ready)');
+    } catch (err: any) {
+      console.warn('[Vynzora Diagnostic] Could not start barge-in listener:', err.message || err);
+    }
+  }, [interruptPlayback, stopBargeInListening]);
+  startBargeInListeningRef.current = startBargeInListening;
 
   // Transition after assistant response audio completes
   // User asks -> Agent responds -> Automatically restart listening -> User asks again
   const handleResponseAudioFinished = useCallback(() => {
     cleanupInterruptionVAD();
+    stopBargeInListening();
+    if (candidateTimeoutRef.current) {
+      clearTimeout(candidateTimeoutRef.current);
+      candidateTimeoutRef.current = null;
+    }
     currentAssistantSpeechTextRef.current = '';
     if (!isWakeWordEnabledRef.current) {
       setVoiceState('DISABLED');
@@ -595,13 +816,20 @@ export default function VynzoraFloatingAssistant() {
       return;
     }
 
-    console.log('[Vynzora Diagnostic] Listening restarted: Ready for next user question');
+    if (!isConversationActiveRef.current) {
+      setVoiceState('WAKE_WORD_STANDBY');
+      voiceStateRef.current = 'WAKE_WORD_STANDBY';
+      startWakeWordListeningRef.current?.();
+      return;
+    }
+
+    console.log('[Vynzora Diagnostic] Assistant response finished. Turn-taking active: listening for next question');
     setVoiceState('CONTINUOUS_LISTENING');
     voiceStateRef.current = 'CONTINUOUS_LISTENING';
 
     // Automatically begin hands-free listening for next question with silence detection
     startRecordingRef.current?.(true);
-  }, [cleanupInterruptionVAD]);
+  }, [cleanupInterruptionVAD, stopBargeInListening]);
 
   // Play audio from base64 string with onEnded callback & complete delivery guarantee
   const playAudioBase64 = useCallback(
@@ -634,13 +862,19 @@ export default function VynzoraFloatingAssistant() {
           `[Vynzora Diagnostic] Voice playback started (${textSpoken ? `"${textSpoken.slice(0, 70)}..."` : 'audio'}) - Complete playback prioritized`
         );
 
-        // Enable acoustic interruption detection while audio is playing
+        // Enable acoustic and speech interruption detection while audio is playing
         if (mediaStreamRef.current && mediaStreamRef.current.active) {
           setupInterruptionVAD(mediaStreamRef.current);
         }
+        startBargeInListening();
 
         const finishPlayback = () => {
           cleanupInterruptionVAD();
+          stopBargeInListening();
+          if (candidateTimeoutRef.current) {
+            clearTimeout(candidateTimeoutRef.current);
+            candidateTimeoutRef.current = null;
+          }
           currentAssistantSpeechTextRef.current = '';
           if (activeRequestId !== currentRequestIdRef.current) {
             console.log('[Vynzora Diagnostic] Request was interrupted, discarding finish callback');
@@ -667,6 +901,11 @@ export default function VynzoraFloatingAssistant() {
         audio.onerror = (e) => {
           console.error('[Vynzora Diagnostic] Audio element playback error:', e);
           cleanupInterruptionVAD();
+          stopBargeInListening();
+          if (candidateTimeoutRef.current) {
+            clearTimeout(candidateTimeoutRef.current);
+            candidateTimeoutRef.current = null;
+          }
           currentAssistantSpeechTextRef.current = '';
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
@@ -676,6 +915,11 @@ export default function VynzoraFloatingAssistant() {
         audio.play().catch((err) => {
           console.warn('[Vynzora Diagnostic] Audio playback interrupted or blocked:', err);
           cleanupInterruptionVAD();
+          stopBargeInListening();
+          if (candidateTimeoutRef.current) {
+            clearTimeout(candidateTimeoutRef.current);
+            candidateTimeoutRef.current = null;
+          }
           currentAssistantSpeechTextRef.current = '';
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
@@ -684,13 +928,18 @@ export default function VynzoraFloatingAssistant() {
       } catch (e) {
         console.error('[Vynzora Diagnostic] Failed to play audio:', e);
         cleanupInterruptionVAD();
+        stopBargeInListening();
+        if (candidateTimeoutRef.current) {
+          clearTimeout(candidateTimeoutRef.current);
+          candidateTimeoutRef.current = null;
+        }
         currentAssistantSpeechTextRef.current = '';
         isPlayingAudioRef.current = false;
         setIsPlayingAudio(false);
         handleResponseAudioFinished();
       }
     },
-    [stopAudio, cleanupInterruptionVAD, setupInterruptionVAD, handleResponseAudioFinished]
+    [stopAudio, cleanupInterruptionVAD, setupInterruptionVAD, startBargeInListening, stopBargeInListening, handleResponseAudioFinished]
   );
 
   // Play Preloaded Wake Greeting:
@@ -723,6 +972,11 @@ export default function VynzoraFloatingAssistant() {
 
       const finishGreeting = () => {
         cleanupInterruptionVAD();
+        stopBargeInListening();
+        if (candidateTimeoutRef.current) {
+          clearTimeout(candidateTimeoutRef.current);
+          candidateTimeoutRef.current = null;
+        }
         currentAssistantSpeechTextRef.current = '';
         if (activeRequestId !== currentRequestIdRef.current) return;
         isPlayingAudioRef.current = false;
@@ -762,17 +1016,20 @@ export default function VynzoraFloatingAssistant() {
       if (mediaStreamRef.current && mediaStreamRef.current.active) {
         setupInterruptionVAD(mediaStreamRef.current);
       }
+      startBargeInListening();
 
       audio.play().catch(() => {
         finishGreeting();
       });
     },
-    [stopAudio, cleanupInterruptionVAD, setupInterruptionVAD]
+    [stopAudio, cleanupInterruptionVAD, setupInterruptionVAD, startBargeInListening, stopBargeInListening]
   );
 
   // Graceful Sleep Response when user says "Stop" or "Go to sleep"
   const playSleepResponse = useCallback(() => {
+    isConversationActiveRef.current = false;
     stopAudio();
+    stopBargeInListening();
     if (stopRecordingRef.current) {
       stopRecordingRef.current();
     }
@@ -805,7 +1062,8 @@ export default function VynzoraFloatingAssistant() {
     } else {
       setTimeout(returnToStandby, 800);
     }
-  }, [stopAudio]);
+  }, [stopAudio, stopBargeInListening]);
+  playSleepResponseRef.current = playSleepResponse;
 
   // ============================================================================
   // TEXT CHAT HANDLER
@@ -1250,14 +1508,27 @@ export default function VynzoraFloatingAssistant() {
 
         mediaRecorder.onstop = async () => {
           cleanupVAD();
-          // If in hands-free mode and no genuine human speech was confirmed, return to standby wake-word listening
+          // If in hands-free mode and no genuine human speech was confirmed in this slice
           if (!hasSpokenRef.current && isHandsFree) {
             console.log(
-              '[Vynzora Diagnostic] No user speech detected; returning assistant to standby wake-word listening'
+              '[Vynzora Diagnostic] No user speech detected in recording slice; maintaining continuous active conversation'
             );
             audioChunksRef.current = [];
             isRecordingRef.current = false;
             setIsRecording(false);
+
+            // If conversation is active: NEVER drop to WAKE_WORD_STANDBY!
+            if (isConversationActiveRef.current) {
+              setVoiceState('CONTINUOUS_LISTENING');
+              voiceStateRef.current = 'CONTINUOUS_LISTENING';
+              setTimeout(() => {
+                if (isConversationActiveRef.current && !isRecordingRef.current && !isPlayingAudioRef.current) {
+                  startRecording(true);
+                }
+              }, 120);
+              return;
+            }
+
             if (isWakeWordEnabledRef.current) {
               setVoiceState('WAKE_WORD_STANDBY');
               voiceStateRef.current = 'WAKE_WORD_STANDBY';
@@ -1337,6 +1608,7 @@ export default function VynzoraFloatingAssistant() {
   const handleWakeWordTriggered = useCallback(
     (detectedTranscript: string) => {
       timingRef.current.activationStartedAt = performance.now();
+      isConversationActiveRef.current = true;
 
       // If AI is currently speaking, user saying "Hey Zora" is a barge-in interruption!
       if (isPlayingAudioRef.current) {
@@ -1344,11 +1616,10 @@ export default function VynzoraFloatingAssistant() {
         stopAudio();
       }
 
-      // 1. Immediately activate assistant window & update state
+      // 1. Immediately exit wake-word standby and open floating assistant interface
+      stopWakeWordListening();
       setIsOpen(true);
       setIsMinimized(false);
-      stopAudio();
-      stopWakeWordListening();
 
       // Check if a question was spoken in the exact same phrase
       // (e.g. "Hey Zora, how many enquiries do we have?")
@@ -1360,6 +1631,8 @@ export default function VynzoraFloatingAssistant() {
         // Direct query provided with wake word
         console.log(`[Vynzora Diagnostic] Direct query captured with wake word: "${queryAfterWake}"`);
         hasHadFirstActivationRef.current = true;
+        setVoiceState('PROCESSING');
+        voiceStateRef.current = 'PROCESSING';
         handleSendMessage(queryAfterWake);
         return;
       }
@@ -1375,26 +1648,32 @@ export default function VynzoraFloatingAssistant() {
       const actLatency = Math.round(performance.now() - timingRef.current.activationStartedAt);
       console.log(`[Vynzora Diagnostic] Assistant activated in ${actLatency}ms (first: ${isFirst})`);
 
+      // 3. Speak the greeting completely, then automatically activate the existing microphone
       playWakeGreeting(isFirst, () => {
-        // 3. Immediately transition to Listening state and record hands-free with silence detection
-        console.log('[Vynzora Diagnostic] Greeting finished, transitioning to listening');
+        console.log('[Vynzora Diagnostic] Greeting finished completely, activating microphone for user question');
+        setVoiceState('LISTENING');
+        voiceStateRef.current = 'LISTENING';
         startRecording(true);
       });
     },
     [stopAudio, stopWakeWordListening, handleSendMessage, playWakeGreeting, startRecording]
   );
+  handleWakeWordTriggeredRef.current = handleWakeWordTriggered;
 
   // ============================================================================
-  // WAKE-WORD DETECTION ENGINE (Ultra-responsive interim matching + top alternatives)
+  // WAKE-WORD DETECTION ENGINE (Standby Mode: Listening for ONLY "Hey Zora")
   // ============================================================================
   const startWakeWordListening = useCallback(() => {
+    // Standby listener ONLY runs when conversation is NOT active
     if (
       !isWakeWordEnabledRef.current ||
+      isConversationActiveRef.current ||
       isRecordingRef.current ||
-      isLoadingRef.current
+      isLoadingRef.current ||
+      isPlayingAudioRef.current
     ) {
       console.log(
-        `[Vynzora Diagnostic] startWakeWordListening skipped (enabled: ${isWakeWordEnabledRef.current}, rec: ${isRecordingRef.current}, loading: ${isLoadingRef.current})`
+        `[Vynzora Diagnostic] startWakeWordListening skipped (enabled: ${isWakeWordEnabledRef.current}, activeConv: ${isConversationActiveRef.current}, rec: ${isRecordingRef.current}, loading: ${isLoadingRef.current}, audio: ${isPlayingAudioRef.current})`
       );
       return;
     }
@@ -1426,164 +1705,21 @@ export default function VynzoraFloatingAssistant() {
       timingRef.current.wakeListenStartedAt = performance.now();
 
       rec.onstart = () => {
-        console.log('[Vynzora Diagnostic] SpeechRecognition engine started (listening for ONLY "Hey Zora")');
+        console.log('[Vynzora Diagnostic] SpeechRecognition engine started (standby listening for ONLY "Hey Zora")');
       };
 
       rec.onaudiostart = () => {
         console.log('[Vynzora Diagnostic] Microphone audio capture active in speech engine');
       };
 
-      rec.onspeechstart = () => {
-        console.log('[Vynzora Diagnostic] User speech detected on microphone');
-      };
-
-      rec.onspeechend = () => {
-        console.log('[Vynzora Diagnostic] User speech ended on microphone');
-      };
-
-      rec.onaudioend = () => {
-        console.log('[Vynzora Diagnostic] Audio stream paused in speech engine');
-      };
-
       rec.onresult = (event: any) => {
-        // Echo prevention: Ignore during active recording or background AI request processing
-        if (isLoadingRef.current || isRecordingRef.current) {
-          return;
-        }
-
-        // Real-Time Barge-In Detection: User speaking while AI is speaking
-        // Full voice response delivery is prioritized. Interruption occurs ONLY when:
-        // 1. Incoming speech is NOT self-echo from assistant's own TTS output.
-        // 2. Clear human voice is recognized with high confidence and meaningful content.
-        // 3. Acoustic VAD confirms energy in human vocal band (300Hz-3400Hz) with high SNR.
-        if (isPlayingAudioRef.current) {
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            for (let a = 0; a < event.results[i].length; a++) {
-              const rawTranscript = event.results[i][a].transcript;
-              const confidence = event.results[i][a].confidence;
-              if (!rawTranscript || !rawTranscript.trim()) continue;
-
-              const trimmed = rawTranscript.trim();
-              const isFinal = event.results[i].isFinal;
-
-              // 1. Filter out self-echo (assistant's own TTS playing out of room/device speakers)
-              if (isSelfEcho(trimmed, currentAssistantSpeechTextRef.current)) {
-                console.log(
-                  `[Vynzora Diagnostic] Discarding self-echo from assistant voice playback: "${trimmed}"`
-                );
-                continue;
-              }
-
-              // 2. Explicit Wake Word Check ("Hey Zora" / "Hey Zorah")
-              const wakeCheck = matchWakeWord(trimmed);
-              if (wakeCheck.matched) {
-                console.log(`[Vynzora Diagnostic] "Hey Zora" wake-word interruption during playback: "${trimmed}"`);
-                try {
-                  rec.abort();
-                } catch {}
-                wakeWordRecRef.current = null;
-                handleWakeWordTriggered(trimmed);
-                return;
-              }
-
-              // 3. Explicit Sleep / Stop Command Check ("Stop", "Sleep", "Cancel", "മതി", "ശരി മതി", "रुको")
-              if (SLEEP_WORD_REGEX.test(trimmed)) {
-                console.log(`[Vynzora Diagnostic] Sleep command interruption during playback: "${trimmed}"`);
-                try {
-                  rec.abort();
-                } catch {}
-                wakeWordRecRef.current = null;
-                playSleepResponse();
-                return;
-              }
-
-              // 4. Genuine User Speech Interruption Validation:
-              // Condition A: Speech Confidence Verification
-              if (confidence !== undefined && confidence > 0 && confidence < SPEECH_CONFIDENCE_THRESHOLD) {
-                console.log(
-                  `[Vynzora Diagnostic] Interruption rejected: Low confidence (${confidence.toFixed(2)} < ${SPEECH_CONFIDENCE_THRESHOLD}): "${trimmed}"`
-                );
-                continue;
-              }
-
-              // Condition B: Minimum meaningful phrase length / recognized command word
-              // Filters out brief noises or one-letter clicks like "a", "oh", "um", "the", etc.
-              const words = trimmed.split(/\s+/).filter(Boolean);
-              const isCommandWord = /^(wait|stop|listen|cancel|hello|help|pause|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|रुको|सुनो)$/i.test(
-                trimmed
-              );
-              if (words.length < 2 && !isCommandWord) {
-                console.log(`[Vynzora Diagnostic] Interruption rejected: Fragmentary noise/single-word: "${trimmed}"`);
-                continue;
-              }
-
-              // Condition C: Acoustic Signal-to-Noise Ratio & Vocal Band Verification
-              const metrics = acousticMetricsRef.current;
-              if (metrics.snr < 10 && metrics.currentRms < 28) {
-                console.log(
-                  `[Vynzora Diagnostic] Interruption rejected: Insufficient voice SNR (${metrics.snr.toFixed(1)} dB < 10 dB): "${trimmed}"`
-                );
-                continue;
-              }
-
-              // ALL CONDITIONS SATISFIED: Genuine human speech interruption confirmed!
-              console.log(
-                `[Vynzora Diagnostic] Confirmed genuine user voice interruption: "${trimmed}" (isFinal: ${isFinal}, SNR: ${metrics.snr.toFixed(1)} dB, Ratio: ${(metrics.voiceBandRatio * 100).toFixed(0)}%, Confidence: ${confidence !== undefined ? confidence.toFixed(2) : 'N/A'})`
-              );
-
-              // 1. Immediately silence TTS playback so agent stops talking over user
-              stopAudio();
-
-              // 2. Abort active network request & signal backend cancel
-              if (activeAbortControllerRef.current) {
-                try {
-                  activeAbortControllerRef.current.abort();
-                } catch {}
-                activeAbortControllerRef.current = null;
-              }
-              const sid = localStorage.getItem('vynzora_ai_session_id');
-              if (sid) {
-                fetch('/api/agent/cancel', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ session_id: sid }),
-                }).catch(() => {});
-              }
-
-              // 3. If final transcript or command word: complete barge-in immediately!
-              if (isFinal || isCommandWord) {
-                if (interimInterruptionTimerRef.current) {
-                  clearTimeout(interimInterruptionTimerRef.current);
-                  interimInterruptionTimerRef.current = null;
-                }
-                try {
-                  rec.abort();
-                } catch {}
-                wakeWordRecRef.current = null;
-                interruptPlayback('confirmed human voice barge-in', trimmed);
-                return;
-              }
-
-              // 4. If interim result (user in middle of speaking their sentence):
-              // Keep interim text and debounce 500ms so we capture the full question!
-              interimInterruptionTextRef.current = trimmed;
-              if (interimInterruptionTimerRef.current) {
-                clearTimeout(interimInterruptionTimerRef.current);
-              }
-              interimInterruptionTimerRef.current = setTimeout(() => {
-                const finalCapture = interimInterruptionTextRef.current || trimmed;
-                interimInterruptionTextRef.current = '';
-                interimInterruptionTimerRef.current = null;
-                try {
-                  rec.abort();
-                } catch {}
-                wakeWordRecRef.current = null;
-                interruptPlayback('confirmed human voice barge-in (interim completed)', finalCapture);
-              }, 500);
-
-              return;
-            }
-          }
+        // Discard if conversation is active, recording, loading, or audio is playing
+        if (
+          isLoadingRef.current ||
+          isRecordingRef.current ||
+          isPlayingAudioRef.current ||
+          isConversationActiveRef.current
+        ) {
           return;
         }
 
@@ -1601,7 +1737,7 @@ export default function VynzoraFloatingAssistant() {
 
             const matchResult = matchWakeWord(rawTranscript);
             console.log(
-              `[Vynzora Diagnostic] Recognized speech: "${rawTranscript}" (isFinal: ${event.results[i].isFinal}, alt: ${a}) -> ` +
+              `[Vynzora Diagnostic] Standby speech: "${rawTranscript}" (isFinal: ${event.results[i].isFinal}, alt: ${a}) -> ` +
                 (matchResult.matched
                   ? `MATCHED ("${matchResult.phrase}")`
                   : `REJECTED (${matchResult.reason || 'no match'})`)
@@ -1650,19 +1786,23 @@ export default function VynzoraFloatingAssistant() {
 
       rec.onend = () => {
         wakeWordRecRef.current = null;
-        // Automatically restart standby listening or speech monitoring with fresh instance
+        // Automatically restart standby listening ONLY when conversation is NOT active
         if (
           isWakeWordEnabledRef.current &&
+          !isConversationActiveRef.current &&
           !isRecordingRef.current &&
-          !isLoadingRef.current
+          !isLoadingRef.current &&
+          !isPlayingAudioRef.current
         ) {
           setTimeout(() => {
             if (
               isWakeWordEnabledRef.current &&
+              !isConversationActiveRef.current &&
               !isRecordingRef.current &&
-              !isLoadingRef.current
+              !isLoadingRef.current &&
+              !isPlayingAudioRef.current
             ) {
-              console.log('[Vynzora Diagnostic] SpeechRecognition ended, restarting fresh listener instance...');
+              console.log('[Vynzora Diagnostic] SpeechRecognition ended, restarting standby listener...');
               startWakeWordListeningRef.current?.();
             }
           }, 100);
@@ -1671,7 +1811,7 @@ export default function VynzoraFloatingAssistant() {
 
       rec.start();
       wakeWordRecRef.current = rec;
-      if (voiceStateRef.current !== 'SPEAKING') {
+      if (!isConversationActiveRef.current && voiceStateRef.current !== 'SPEAKING') {
         setVoiceState('WAKE_WORD_STANDBY');
         voiceStateRef.current = 'WAKE_WORD_STANDBY';
       }
@@ -1679,7 +1819,7 @@ export default function VynzoraFloatingAssistant() {
     } catch (err: any) {
       console.warn('[Vynzora Diagnostic] Could not initialize wake-word recognition:', err.message || err);
     }
-  }, [handleWakeWordTriggered, interruptPlayback, playSleepResponse]);
+  }, [handleWakeWordTriggered]);
   startWakeWordListeningRef.current = startWakeWordListening;
 
   // ============================================================================
@@ -1717,7 +1857,7 @@ export default function VynzoraFloatingAssistant() {
           console.log('[Vynzora Diagnostic] Microphone permission granted');
           console.log('[Vynzora Diagnostic] Microphone initialized and stream cached');
 
-          if (mounted) {
+          if (mounted && !isConversationActiveRef.current) {
             setMicPermission('granted');
             setVoiceState('WAKE_WORD_STANDBY');
             voiceStateRef.current = 'WAKE_WORD_STANDBY';
@@ -1753,7 +1893,7 @@ export default function VynzoraFloatingAssistant() {
             mediaStreamRef.current = stream;
             console.log('[Vynzora Diagnostic] Microphone permission granted (on interaction)');
             console.log('[Vynzora Diagnostic] Microphone initialized');
-            if (mounted) {
+            if (mounted && !isConversationActiveRef.current) {
               setMicPermission('granted');
               setVoiceState('WAKE_WORD_STANDBY');
               voiceStateRef.current = 'WAKE_WORD_STANDBY';
@@ -1777,6 +1917,7 @@ export default function VynzoraFloatingAssistant() {
     return () => {
       mounted = false;
       stopWakeWordListeningRef.current?.();
+      stopBargeInListeningRef.current?.();
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;
@@ -1798,9 +1939,11 @@ export default function VynzoraFloatingAssistant() {
       console.log('[Vynzora Diagnostic] Microphone permission granted manually');
       console.log('[Vynzora Diagnostic] Microphone initialized');
       setMicPermission('granted');
-      setVoiceState('WAKE_WORD_STANDBY');
-      voiceStateRef.current = 'WAKE_WORD_STANDBY';
-      startWakeWordListening();
+      if (!isConversationActiveRef.current) {
+        setVoiceState('WAKE_WORD_STANDBY');
+        voiceStateRef.current = 'WAKE_WORD_STANDBY';
+        startWakeWordListening();
+      }
     } catch (err: any) {
       console.warn('[Vynzora Diagnostic] Microphone permission request failed:', err.message || err);
       setMicPermission('denied');
@@ -1815,21 +1958,26 @@ export default function VynzoraFloatingAssistant() {
     isWakeWordEnabledRef.current = nextVal;
     localStorage.setItem('vynzora_wake_word_enabled', String(nextVal));
     if (nextVal) {
+      isConversationActiveRef.current = false;
       setVoiceState('WAKE_WORD_STANDBY');
       voiceStateRef.current = 'WAKE_WORD_STANDBY';
       startWakeWordListening();
     } else {
+      isConversationActiveRef.current = false;
       stopWakeWordListening();
+      stopBargeInListening();
       setVoiceState('DISABLED');
       voiceStateRef.current = 'DISABLED';
     }
   };
 
   const handleClearHistory = () => {
+    isConversationActiveRef.current = false;
     currentRequestIdRef.current++;
     hasHadFirstActivationRef.current = false;
     stopAudio();
     stopRecording();
+    stopBargeInListening();
     setMessages([]);
     const newSid = 'vynzora-' + Date.now().toString(36) + '-' + Math.random().toString(36).substr(2, 5);
     localStorage.setItem('vynzora_ai_session_id', newSid);
@@ -1876,7 +2024,11 @@ export default function VynzoraFloatingAssistant() {
             <Sparkles className="w-6 h-6 animate-pulse" />
             <span
               className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full ring-2 ring-slate-950 ${
-                voiceState === 'LISTENING' || voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
+                voiceState === 'USER_SPEECH_CANDIDATE'
+                  ? 'bg-amber-400 animate-pulse'
+                  : voiceState === 'USER_SPEECH_CONFIRMED'
+                  ? 'bg-rose-400 animate-ping'
+                  : voiceState === 'LISTENING' || voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
                   ? 'bg-amber-400 animate-ping'
                   : voiceState === 'INTERRUPTED'
                   ? 'bg-amber-400 animate-ping'
@@ -1907,6 +2059,10 @@ export default function VynzoraFloatingAssistant() {
                 <span>
                   {voiceState === 'INITIALIZING'
                     ? 'Initializing...'
+                    : voiceState === 'USER_SPEECH_CANDIDATE'
+                    ? 'Checking Speech...'
+                    : voiceState === 'USER_SPEECH_CONFIRMED'
+                    ? 'Interrupted! Listening...'
                     : voiceState === 'ACTIVATED'
                     ? 'Activated: "Hello! I\'m Zora..."'
                     : voiceState === 'LISTENING'
@@ -1978,6 +2134,10 @@ export default function VynzoraFloatingAssistant() {
                         ? 'bg-slate-800/80 text-slate-400 border-slate-700 hover:text-slate-200'
                         : voiceState === 'INITIALIZING'
                         ? 'bg-slate-800 text-slate-300 border-slate-700'
+                        : voiceState === 'USER_SPEECH_CANDIDATE'
+                        ? 'bg-amber-500/20 text-amber-200 border-amber-500/40 animate-pulse'
+                        : voiceState === 'USER_SPEECH_CONFIRMED'
+                        ? 'bg-rose-500/30 text-rose-200 border-rose-400 animate-pulse'
                         : voiceState === 'LISTENING'
                         ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
                         : voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
@@ -2001,6 +2161,10 @@ export default function VynzoraFloatingAssistant() {
                         <span>
                           {voiceState === 'INITIALIZING'
                             ? 'Initializing...'
+                            : voiceState === 'USER_SPEECH_CANDIDATE'
+                            ? 'Checking Voice...'
+                            : voiceState === 'USER_SPEECH_CONFIRMED'
+                            ? 'Interrupted'
                             : voiceState === 'LISTENING'
                             ? 'Listening...'
                             : voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
@@ -2060,8 +2224,10 @@ export default function VynzoraFloatingAssistant() {
 
               <button
                 onClick={() => {
+                  isConversationActiveRef.current = false;
                   stopAudio();
                   stopRecording();
+                  stopBargeInListening();
                   setIsOpen(false);
                   if (isWakeWordEnabled) {
                     setVoiceState('WAKE_WORD_STANDBY');
@@ -2086,7 +2252,9 @@ export default function VynzoraFloatingAssistant() {
                   <div className="flex items-center gap-2">
                     <Volume2 className="w-4 h-4 text-emerald-400 animate-pulse" />
                     <span className="font-medium text-[11px]">
-                      {voiceState === 'ACTIVATED'
+                      {voiceState === 'USER_SPEECH_CANDIDATE'
+                        ? 'Candidate speech detected... (Evaluating)'
+                        : voiceState === 'ACTIVATED'
                         ? 'Zora: Greeting... (Speak or click to interrupt)'
                         : 'Speaking... (Speak at any time to interrupt)'}
                     </span>
@@ -2271,15 +2439,19 @@ export default function VynzoraFloatingAssistant() {
                 <button
                   type="button"
                   onClick={
-                    voiceState === 'SPEAKING'
+                    voiceState === 'SPEAKING' || voiceState === 'USER_SPEECH_CANDIDATE'
                       ? () => interruptPlayback('mic button clicked during playback')
                       : isRecording
                       ? stopRecording
                       : () => startRecording(false)
                   }
-                  disabled={isLoading && !isRecording && voiceState !== 'SPEAKING'}
+                  disabled={isLoading && !isRecording && voiceState !== 'SPEAKING' && voiceState !== 'USER_SPEECH_CANDIDATE'}
                   className={`p-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center shrink-0 ${
-                    voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
+                    voiceState === 'USER_SPEECH_CANDIDATE'
+                      ? 'bg-amber-600 text-white animate-pulse shadow-lg shadow-amber-600/60 ring-2 ring-amber-400'
+                      : voiceState === 'USER_SPEECH_CONFIRMED'
+                      ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/60 ring-2 ring-rose-400'
+                      : voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
                       ? 'bg-rose-600 text-white animate-pulse shadow-lg shadow-rose-600/60 ring-2 ring-rose-400'
                       : voiceState === 'INTERRUPTED'
                       ? 'bg-amber-500 text-white animate-pulse shadow-lg shadow-amber-500/50 ring-2 ring-amber-400/80'
@@ -2296,7 +2468,11 @@ export default function VynzoraFloatingAssistant() {
                       : 'bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800'
                   }`}
                   title={
-                    voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
+                    voiceState === 'USER_SPEECH_CANDIDATE'
+                      ? 'Checking speech candidate (Click to interrupt immediately)'
+                      : voiceState === 'USER_SPEECH_CONFIRMED'
+                      ? 'Interrupted! Capturing your question...'
+                      : voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED'
                       ? 'User Speaking (Speaking... Click to cancel)'
                       : voiceState === 'INTERRUPTED'
                       ? 'Interrupted! Capturing your question...'
@@ -2311,7 +2487,11 @@ export default function VynzoraFloatingAssistant() {
                       : 'Standby: Say "Hey Zora" (or click to speak)'
                   }
                 >
-                  {voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED' ? (
+                  {voiceState === 'USER_SPEECH_CANDIDATE' ? (
+                    <Activity className="w-4 h-4 text-amber-200 animate-pulse" />
+                  ) : voiceState === 'USER_SPEECH_CONFIRMED' ? (
+                    <Activity className="w-4 h-4 text-white animate-ping" />
+                  ) : voiceState === 'USER_SPEAKING' || voiceState === 'SPEECH_DETECTED' ? (
                     <Activity className="w-4 h-4 text-white animate-pulse" />
                   ) : voiceState === 'INTERRUPTED' ? (
                     <Mic className="w-4 h-4 text-amber-200 animate-pulse" />
@@ -2340,7 +2520,7 @@ export default function VynzoraFloatingAssistant() {
                       ? 'Listening to microphone (pause when done)...'
                       : voiceState === 'ACTIVATED'
                       ? 'Activating Zora...'
-                      : voiceState === 'SPEAKING'
+                      : voiceState === 'SPEAKING' || voiceState === 'USER_SPEECH_CANDIDATE'
                       ? 'Speaking (speak or click to interrupt)...'
                       : voiceState === 'CONTINUOUS_LISTENING'
                       ? 'Conversation active: ask question, or say "Stop"...'
