@@ -9,7 +9,7 @@ import uvicorn
 
 import config
 from gemini_agent import agent_manager, MODEL_NAME
-from voice_handler import transcribe_audio_file, generate_speech_audio
+from voice_handler import transcribe_audio_file, generate_speech_audio, generate_speech_audio_chunks
 
 # Configure logging
 logging.basicConfig(
@@ -106,14 +106,18 @@ async def chat_endpoint(payload: ChatRequest):
         ai_text = result["response"]
         detected_lang = result.get("detected_language") or payload.language or "en-IN"
 
-        # Generate complete gTTS voice audio so voice output is always available
+        # Generate fast first sentence chunk and full chunks for rapid playback
+        first_audio_base64 = None
+        audio_chunks_base64 = []
         audio_base64 = None
         try:
-            audio_mp3_bytes = generate_speech_audio(
+            first_chunk_bytes, all_chunks_bytes, sentences = generate_speech_audio_chunks(
                 text=ai_text,
                 detected_language=detected_lang
             )
-            audio_base64 = base64.b64encode(audio_mp3_bytes).decode("utf-8")
+            first_audio_base64 = base64.b64encode(first_chunk_bytes).decode("utf-8")
+            audio_chunks_base64 = [base64.b64encode(c).decode("utf-8") for c in all_chunks_bytes]
+            audio_base64 = base64.b64encode(b"".join(all_chunks_bytes)).decode("utf-8")
         except Exception as tts_err:
             logger.warning(f"Could not synthesize speech audio in /agent/chat: {tts_err}")
 
@@ -122,6 +126,8 @@ async def chat_endpoint(payload: ChatRequest):
             "response": ai_text,
             "session_id": result["session_id"],
             "detected_language": detected_lang,
+            "first_audio_base64": first_audio_base64,
+            "audio_chunks": audio_chunks_base64,
             "audio_base64": audio_base64
         }
     except Exception as e:
@@ -182,18 +188,22 @@ async def voice_endpoint(
         ai_text = result["response"]
         active_session_id = result["session_id"]
 
-        # 3. Text-to-Speech via gTTS
-        audio_mp3_bytes = generate_speech_audio(
+        # 3. Text-to-Speech via gTTS with chunked fast first audio delivery
+        first_chunk_bytes, all_chunks_bytes, sentences = generate_speech_audio_chunks(
             text=ai_text,
             detected_language=detected_lang
         )
-        audio_base64 = base64.b64encode(audio_mp3_bytes).decode("utf-8")
+        first_audio_base64 = base64.b64encode(first_chunk_bytes).decode("utf-8")
+        audio_chunks_base64 = [base64.b64encode(c).decode("utf-8") for c in all_chunks_bytes]
+        audio_base64 = base64.b64encode(b"".join(all_chunks_bytes)).decode("utf-8")
 
         return {
             "status": "success",
             "transcript": transcript,
             "detected_language": detected_lang,
             "response": ai_text,
+            "first_audio_base64": first_audio_base64,
+            "audio_chunks": audio_chunks_base64,
             "audio_base64": audio_base64,
             "session_id": active_session_id
         }

@@ -209,6 +209,61 @@ export function isSelfEcho(incomingRaw: string, assistantSpokenText: string): bo
   return false;
 }
 
+/**
+ * Adaptive Speech Endpoint Detection:
+ * Calculates the dynamic silence duration (in ms) before cutting off recording,
+ * based on syntax completeness, question endings, command keywords, and trailing conjunctions.
+ */
+export function computeAdaptiveSilenceTimeoutMs(transcript: string, isFinal: boolean = false): number {
+  if (!transcript || !transcript.trim()) {
+    return 750;
+  }
+  const trimmed = transcript.trim();
+  const words = trimmed.split(/\s+/).filter(Boolean);
+
+  // 1. Single Command Word (e.g. "stop", "cancel", "help", "pause", "ശരി", "മതി", "നിൽക്കൂ", "രുക്കോ", "रुको")
+  // Short commands require fast cutoff (350 - 400ms)
+  const isCommandWord = /^(wait|stop|listen|cancel|hello|help|pause|hold\s*on|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|രുക്കോ|रुको|सुनो)$/i.test(trimmed);
+  if (isCommandWord || (words.length === 1 && trimmed.length <= 6)) {
+    return 380;
+  }
+
+  // 2. Trailing Conjunctions / Incomplete sentence markers
+  // (e.g. "and", "or", "because", "but", "with", "then", "കൂടാതെ", "പക്ഷേ", "എന്നാൽ", "aur", "lekin", "kyunki")
+  // Give user extended time (1000 - 1200ms) to complete their thought!
+  const hasTrailingConnector = /(?:^|[\s\b])(and|or|because|but|with|then|also|if|that|what|where|how|who|കൂടാതെ|പക്ഷേ|എന്നാൽ|അതുകൊണ്ട്|aur|lekin|kyunki|yadi)\s*$/i.test(trimmed);
+  if (hasTrailingConnector) {
+    return 1100;
+  }
+
+  // 3. Complete Sentences / Questions:
+  // - Terminal punctuation: ?, ., !, ।
+  // - Interrogative / Question endings:
+  //   Malayalam question endings: ഉണ്ട്?, ഉണ്ടോ?, ആണോ?, കാണിക്കൂ, പറയൂ, എത്ര?, എന്ത്?
+  //   Hindi question endings: कितने हैं?, क्या है?, बताइए?, बताओ
+  //   English question structures: how many..., show me..., tell me..., what is...
+  const hasTerminalPunctuation = /[?.!।]$/.test(trimmed);
+  const isMalayalamQuestion = /(?:^|[\s\b])(ഉണ്ടോ|ആണോ|എത്ര|എന്ത്|എവിടെ|ആരാണ്|കാണിക്കൂ|പറയൂ|നൽകൂ|തരു|ചെയ്യൂ|ലിസ്റ്റ്|വിവരങ്ങൾ)/i.test(trimmed);
+  const isHindiQuestion = /(?:^|[\s\b])(कितने|क्या|कहाँ|कौन|बताइए|बताओ|दिखाइए|दिखाओ|कीजिए)/i.test(trimmed);
+  const isEnglishQuestion = /^(how\s+many|show\s+me|tell\s+me|what\s+is|who\s+is|where\s+is|list|give\s+me|can\s+you|please)\b/i.test(trimmed);
+
+  if (hasTerminalPunctuation || isFinal) {
+    return 480; // Fast endpointing for verified complete sentence
+  }
+
+  if ((isMalayalamQuestion || isHindiQuestion || isEnglishQuestion) && words.length >= 2) {
+    return 520; // 520ms for recognized complete question syntax
+  }
+
+  // 4. Multi-word general speech (>= 4 words)
+  if (words.length >= 4) {
+    return 600;
+  }
+
+  // 5. Short incomplete phrase
+  return 750;
+}
+
 export default function VynzoraFloatingAssistant() {
   const [isOpen, setIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -270,6 +325,13 @@ export default function VynzoraFloatingAssistant() {
   const interimInterruptionTimerRef = useRef<any>(null);
   const interimInterruptionTextRef = useRef<string>('');
 
+  // Live Streaming Speech Recognition & Chunked Audio Playback Refs
+  const liveStreamingTranscriptRef = useRef<string>('');
+  const isStreamingFinalRef = useRef<boolean>(false);
+  const streamingLiveRecRef = useRef<any>(null);
+  const audioChunkUrlsRef = useRef<string[]>([]);
+  const currentChunkIndexRef = useRef<number>(0);
+
   // Audio Priority & Self-Echo Rejection Tracking
   const currentAssistantSpeechTextRef = useRef<string>(''); // Currently playing TTS text
   const acousticMetricsRef = useRef<{
@@ -291,21 +353,33 @@ export default function VynzoraFloatingAssistant() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const vadIntervalRef = useRef<any>(null);
 
-  // High-Resolution Diagnostic Timing Refs (Section 5)
+  // High-Resolution Diagnostic Timing Refs (Measuring latency across all stages)
   const timingRef = useRef<{
     wakeListenStartedAt: number;
     activationStartedAt: number;
     micStartedAt: number;
     reqStartedAt: number;
+    aiFinishedAt: number;
     playStartedAt: number;
     playEndedAt: number;
+    userSpeechStartedAt: number;
+    userSpeechEndedAt: number;
+    endpointDetectedAt: number;
+    firstAudioStartedAt: number;
+    interruptionTriggeredAt: number;
   }>({
     wakeListenStartedAt: 0,
     activationStartedAt: 0,
     micStartedAt: 0,
     reqStartedAt: 0,
+    aiFinishedAt: 0,
     playStartedAt: 0,
     playEndedAt: 0,
+    userSpeechStartedAt: 0,
+    userSpeechEndedAt: 0,
+    endpointDetectedAt: 0,
+    firstAudioStartedAt: 0,
+    interruptionTriggeredAt: 0,
   });
 
   // Synchronous State Mirrors (avoids async React state lags)
@@ -464,6 +538,15 @@ export default function VynzoraFloatingAssistant() {
       } catch {}
       audioElementRef.current = null;
     }
+    if (audioChunkUrlsRef.current.length > 0) {
+      audioChunkUrlsRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      });
+      audioChunkUrlsRef.current = [];
+    }
+    currentChunkIndexRef.current = 0;
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       try {
         window.speechSynthesis.cancel();
@@ -476,9 +559,10 @@ export default function VynzoraFloatingAssistant() {
   // Real-Time Barge-In Voice Interruption (Highest Priority)
   // Immediately stops current TTS playback, cancels remaining audio,
   // aborts active network requests, cancels backend Gemini/TTS,
-  // and processes new user speech without forcing them to repeat.
+  // and captures user's complete question before submitting to AI.
   const interruptPlayback = useCallback(
     (reason = 'voice barge-in', capturedText?: string) => {
+      const interruptTriggerTime = performance.now();
       console.log(`[Vynzora Diagnostic] Real-time Interruption triggered (${reason})! Halting playback immediately.`);
 
       // 1. Immediately abort active network fetch
@@ -494,6 +578,8 @@ export default function VynzoraFloatingAssistant() {
 
       // 3. Immediately stop and reset audio playback & barge-in
       stopAudio();
+      const stopLatency = Math.round(performance.now() - interruptTriggerTime);
+      console.log(`[Vynzora Latency] Interruption stop latency: ${stopLatency}ms (audio stopped, backend cancelling)`);
 
       // 4. Send cancellation notification to backend in background
       const sid = localStorage.getItem('vynzora_ai_session_id');
@@ -508,19 +594,36 @@ export default function VynzoraFloatingAssistant() {
       setVoiceState('USER_SPEECH_CONFIRMED');
       voiceStateRef.current = 'USER_SPEECH_CONFIRMED';
 
-      // 5. If user spoke a complete question during interruption, process it immediately!
-      // Do not make the user repeat their question!
       const trimmedText = capturedText ? capturedText.trim() : '';
-      const isInterjection = /^(wait|hold\s+on|listen|pause|hello|help|cancel|നിൽക്കൂ|കേൾക്കൂ|ശരി|ശരി\s+മതി|മതി|रुको|सुनो)$/i.test(trimmedText);
-      if (trimmedText && trimmedText.length >= 4 && !isInterjection) {
-        console.log(`[Vynzora Diagnostic] Captured user interruption question directly: "${trimmedText}"`);
-        if (handleSendMessageRef.current) {
-          handleSendMessageRef.current(trimmedText);
-          return;
+
+      // Check if user spoke a sleep/cancel command
+      if (SLEEP_WORD_REGEX.test(trimmedText)) {
+        console.log(`[Vynzora Diagnostic] Interruption was sleep command: "${trimmedText}"`);
+        if (playSleepResponseRef.current) {
+          playSleepResponseRef.current();
         }
+        return;
       }
 
-      // 6. Otherwise immediately activate microphone hands-free to capture ongoing speech
+      // CRITICAL: User interrupted to ask a question!
+      // Do NOT send an incomplete sentence immediately!
+      // Instead, pre-populate live transcript buffer with what was captured so far,
+      // switch to LISTENING, and continue capturing the full question!
+      if (
+        trimmedText &&
+        !/^(wait|hold\s+on|listen|pause|hello|help|cancel|നിൽക്കൂ|കേൾക്കൂ|ശരി|ശരി\s+മതി|മതി|രുക്കോ|रुको|सुनो)$/i.test(
+          trimmedText
+        )
+      ) {
+        liveStreamingTranscriptRef.current = trimmedText;
+        console.log(
+          `[Vynzora Diagnostic] Preserving initial interruption words: "${trimmedText}". Continuing to listen for full question...`
+        );
+      } else {
+        liveStreamingTranscriptRef.current = '';
+      }
+
+      // 6. Immediately activate microphone hands-free to capture complete ongoing speech
       setVoiceState('LISTENING');
       voiceStateRef.current = 'LISTENING';
       setTimeout(() => {
@@ -831,26 +934,33 @@ export default function VynzoraFloatingAssistant() {
     startRecordingRef.current?.(true);
   }, [cleanupInterruptionVAD, stopBargeInListening]);
 
-  // Play audio from base64 string with onEnded callback & complete delivery guarantee
-  const playAudioBase64 = useCallback(
-    (base64Audio: string, onEnded?: () => void, textSpoken?: string) => {
+  // Play chunked audio sequentially for rapid first audio playback
+  const playAudioChunks = useCallback(
+    (chunks: string[], onEnded?: () => void, textSpoken?: string) => {
       try {
         stopAudio();
+        if (!chunks || chunks.length === 0) {
+          handleResponseAudioFinished();
+          return;
+        }
+
         const activeRequestId = currentRequestIdRef.current;
         currentAssistantSpeechTextRef.current = textSpoken || '';
 
-        const byteCharacters = atob(base64Audio);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: 'audio/mpeg' });
-        const url = URL.createObjectURL(blob);
+        // Convert base64 chunks to object URLs
+        const urls: string[] = chunks.map((b64) => {
+          const byteCharacters = atob(b64);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const blob = new Blob([byteArray], { type: 'audio/mpeg' });
+          return URL.createObjectURL(blob);
+        });
 
-        setCurrentAudioUrl(url);
-        const audio = new Audio(url);
-        audioElementRef.current = audio;
+        audioChunkUrlsRef.current = urls;
+        currentChunkIndexRef.current = 0;
 
         isPlayingAudioRef.current = true;
         setIsPlayingAudio(true);
@@ -858,8 +968,12 @@ export default function VynzoraFloatingAssistant() {
         voiceStateRef.current = 'SPEAKING';
 
         timingRef.current.playStartedAt = performance.now();
+        timingRef.current.firstAudioStartedAt = performance.now();
+        const firstAudioLatency = timingRef.current.aiFinishedAt
+          ? Math.round(performance.now() - timingRef.current.aiFinishedAt)
+          : 0;
         console.log(
-          `[Vynzora Diagnostic] Voice playback started (${textSpoken ? `"${textSpoken.slice(0, 70)}..."` : 'audio'}) - Complete playback prioritized`
+          `[Vynzora Latency] First audio chunk playback started in ${firstAudioLatency}ms (total chunks: ${chunks.length})`
         );
 
         // Enable acoustic and speech interruption detection while audio is playing
@@ -882,7 +996,9 @@ export default function VynzoraFloatingAssistant() {
           }
           timingRef.current.playEndedAt = performance.now();
           const duration = Math.round(timingRef.current.playEndedAt - timingRef.current.playStartedAt);
-          console.log(`[Vynzora Diagnostic] Complete voice response delivered successfully in ${duration}ms`);
+          console.log(
+            `[Vynzora Latency] Complete voice response (${urls.length} chunks) delivered successfully in ${duration}ms`
+          );
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
           // 250ms acoustic buffer
@@ -896,37 +1012,40 @@ export default function VynzoraFloatingAssistant() {
           }, 250);
         };
 
-        audio.onended = finishPlayback;
-
-        audio.onerror = (e) => {
-          console.error('[Vynzora Diagnostic] Audio element playback error:', e);
-          cleanupInterruptionVAD();
-          stopBargeInListening();
-          if (candidateTimeoutRef.current) {
-            clearTimeout(candidateTimeoutRef.current);
-            candidateTimeoutRef.current = null;
+        const playChunk = (index: number) => {
+          if (activeRequestId !== currentRequestIdRef.current) return;
+          if (index >= urls.length) {
+            finishPlayback();
+            return;
           }
-          currentAssistantSpeechTextRef.current = '';
-          isPlayingAudioRef.current = false;
-          setIsPlayingAudio(false);
-          handleResponseAudioFinished();
+
+          const url = urls[index];
+          setCurrentAudioUrl(url);
+          const audio = new Audio(url);
+          audioElementRef.current = audio;
+
+          audio.onended = () => {
+            currentChunkIndexRef.current = index + 1;
+            playChunk(index + 1);
+          };
+
+          audio.onerror = (e) => {
+            console.warn(`[Vynzora Diagnostic] Audio chunk error at index ${index}:`, e);
+            currentChunkIndexRef.current = index + 1;
+            playChunk(index + 1);
+          };
+
+          audio.play().catch((err) => {
+            console.warn('[Vynzora Diagnostic] Audio chunk play prevented or interrupted:', err);
+            if (activeRequestId !== currentRequestIdRef.current) return;
+            currentChunkIndexRef.current = index + 1;
+            playChunk(index + 1);
+          });
         };
 
-        audio.play().catch((err) => {
-          console.warn('[Vynzora Diagnostic] Audio playback interrupted or blocked:', err);
-          cleanupInterruptionVAD();
-          stopBargeInListening();
-          if (candidateTimeoutRef.current) {
-            clearTimeout(candidateTimeoutRef.current);
-            candidateTimeoutRef.current = null;
-          }
-          currentAssistantSpeechTextRef.current = '';
-          isPlayingAudioRef.current = false;
-          setIsPlayingAudio(false);
-          handleResponseAudioFinished();
-        });
+        playChunk(0);
       } catch (e) {
-        console.error('[Vynzora Diagnostic] Failed to play audio:', e);
+        console.error('[Vynzora Diagnostic] Failed to play audio chunks:', e);
         cleanupInterruptionVAD();
         stopBargeInListening();
         if (candidateTimeoutRef.current) {
@@ -940,6 +1059,14 @@ export default function VynzoraFloatingAssistant() {
       }
     },
     [stopAudio, cleanupInterruptionVAD, setupInterruptionVAD, startBargeInListening, stopBargeInListening, handleResponseAudioFinished]
+  );
+
+  // Play audio from base64 string with onEnded callback & complete delivery guarantee
+  const playAudioBase64 = useCallback(
+    (base64Audio: string, onEnded?: () => void, textSpoken?: string) => {
+      playAudioChunks([base64Audio], onEnded, textSpoken);
+    },
+    [playAudioChunks]
   );
 
   // Play Preloaded Wake Greeting:
@@ -1140,8 +1267,9 @@ export default function VynzoraFloatingAssistant() {
           throw new Error(data.detail || 'Could not reach Vynzora AI Agent.');
         }
 
+        timingRef.current.aiFinishedAt = performance.now();
         const duration = Math.round(performance.now() - timingRef.current.reqStartedAt);
-        console.log(`[Vynzora Diagnostic] AI response received in ${duration}ms: "${data.response.slice(0, 100)}..."`);
+        console.log(`[Vynzora Latency] AI response generation duration: ${duration}ms: "${data.response.slice(0, 100)}..."`);
 
         const assistantMessage: ChatMessage = {
           id: `assistant-${Date.now()}`,
@@ -1152,8 +1280,10 @@ export default function VynzoraFloatingAssistant() {
 
         setMessages((prev) => [...prev, assistantMessage]);
 
-        // Synthesize voice reply if spoken or hands-free
-        if (data.audio_base64) {
+        // Synthesize voice reply if spoken or hands-free (chunked fast first audio)
+        if (data.audio_chunks && data.audio_chunks.length > 0) {
+          playAudioChunks(data.audio_chunks, () => handleResponseAudioFinished(), data.response);
+        } else if (data.audio_base64) {
           playAudioBase64(data.audio_base64, () => handleResponseAudioFinished(), data.response);
         } else {
           handleResponseAudioFinished();
@@ -1186,7 +1316,7 @@ export default function VynzoraFloatingAssistant() {
         }
       }
     },
-    [inputValue, sessionId, playAudioBase64, playSleepResponse, handleResponseAudioFinished]
+    [inputValue, sessionId, playAudioChunks, playAudioBase64, playSleepResponse, handleResponseAudioFinished]
   );
   handleSendMessageRef.current = handleSendMessage;
 
@@ -1207,8 +1337,90 @@ export default function VynzoraFloatingAssistant() {
     setLiveAudioLevel(0);
   }, []);
 
+  const stopLiveStreamingASR = useCallback(() => {
+    if (streamingLiveRecRef.current) {
+      try {
+        streamingLiveRecRef.current.abort();
+      } catch {}
+      streamingLiveRecRef.current = null;
+    }
+  }, []);
+
+  const startLiveStreamingASR = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    try {
+      stopLiveStreamingASR();
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 2;
+      rec.lang =
+        currentLanguageRef.current === 'ml-IN'
+          ? 'ml-IN'
+          : currentLanguageRef.current === 'hi-IN'
+          ? 'hi-IN'
+          : 'en-US';
+
+      rec.onresult = (event: any) => {
+        if (!isRecordingRef.current) return;
+        let interimText = '';
+        let finalText = '';
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const res = event.results[i];
+          if (res.isFinal) {
+            finalText += res[0].transcript + ' ';
+            isStreamingFinalRef.current = true;
+          } else {
+            interimText += res[0].transcript;
+          }
+        }
+
+        const combined = (finalText + ' ' + interimText).trim();
+        if (combined) {
+          liveStreamingTranscriptRef.current = combined;
+          hasSpokenRef.current = true;
+          if (voiceStateRef.current !== 'USER_SPEAKING') {
+            setVoiceState('USER_SPEAKING');
+            voiceStateRef.current = 'USER_SPEAKING';
+          }
+          console.log(`[Vynzora Diagnostic] Live ASR streaming: "${combined}"`);
+        }
+      };
+
+      rec.onerror = (e: any) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('[Vynzora Diagnostic] Live ASR status:', e.error);
+        }
+      };
+
+      rec.onend = () => {
+        streamingLiveRecRef.current = null;
+        if (isRecordingRef.current) {
+          setTimeout(() => {
+            if (isRecordingRef.current) {
+              startLiveStreamingASR();
+            }
+          }, 80);
+        }
+      };
+
+      rec.start();
+      streamingLiveRecRef.current = rec;
+      console.log(`[Vynzora Diagnostic] Live streaming speech recognition active (${rec.lang})`);
+    } catch (e: any) {
+      console.warn('[Vynzora Diagnostic] Could not start live streaming ASR:', e.message || e);
+    }
+  }, [stopLiveStreamingASR]);
+
   const stopRecording = useCallback(() => {
     cleanupVAD();
+    stopLiveStreamingASR();
     if (recordTimerRef.current) {
       clearInterval(recordTimerRef.current);
       recordTimerRef.current = null;
@@ -1221,7 +1433,7 @@ export default function VynzoraFloatingAssistant() {
     isRecordingRef.current = false;
     setIsRecording(false);
     setIsManualRecording(false);
-  }, [cleanupVAD]);
+  }, [cleanupVAD, stopLiveStreamingASR]);
   stopRecordingRef.current = stopRecording;
 
   const processVoiceBlob = useCallback(
@@ -1302,8 +1514,9 @@ export default function VynzoraFloatingAssistant() {
           currentLanguageRef.current = 'en-US';
         }
 
+        timingRef.current.aiFinishedAt = performance.now();
         const duration = Math.round(performance.now() - timingRef.current.reqStartedAt);
-        console.log(`[Vynzora Diagnostic] Speech recognition + AI response received in ${duration}ms`);
+        console.log(`[Vynzora Latency] Speech recognition + AI response received in ${duration}ms`);
         console.log(`[Vynzora Diagnostic] Transcript generated: "${data.transcript}" (Language: ${data.detected_language})`);
         console.log(`[Vynzora Diagnostic] AI response received: "${data.response.slice(0, 100)}..."`);
 
@@ -1343,8 +1556,12 @@ export default function VynzoraFloatingAssistant() {
 
         setMessages((prev) => [...prev, userMessage, assistantMessage]);
 
-        // Automatically play synthesized gTTS audio (barge-in enabled)
-        if (data.audio_base64) {
+        // Automatically play synthesized gTTS audio (chunked fast first audio, barge-in enabled)
+        if (data.audio_chunks && data.audio_chunks.length > 0) {
+          playAudioChunks(data.audio_chunks, () => {
+            handleResponseAudioFinished();
+          }, data.response);
+        } else if (data.audio_base64) {
           playAudioBase64(data.audio_base64, () => {
             handleResponseAudioFinished();
           }, data.response);
@@ -1380,10 +1597,10 @@ export default function VynzoraFloatingAssistant() {
         }
       }
     },
-    [sessionId, playAudioBase64, playSleepResponse, handleResponseAudioFinished]
+    [sessionId, playAudioChunks, playAudioBase64, playSleepResponse, handleResponseAudioFinished]
   );
 
-  // Setup Voice Activity and Continuous Silence Detection
+  // Setup Voice Activity and Continuous Silence Detection with Adaptive Endpointing
   const setupVAD = useCallback(
     (stream: MediaStream, onSilenceDetected: () => void, onRecycleBuffer: () => void) => {
       try {
@@ -1418,6 +1635,7 @@ export default function VynzoraFloatingAssistant() {
             speechAccumulatedMs += 80;
             if (speechAccumulatedMs >= MIN_SPEECH_DURATION_MS) {
               if (!hasSpokenRef.current) {
+                timingRef.current.userSpeechStartedAt = performance.now();
                 console.log(`[Vynzora Diagnostic] User speech detected (level: ${Math.round(avg)})`);
                 setVoiceState('USER_SPEAKING');
                 voiceStateRef.current = 'USER_SPEAKING';
@@ -1429,12 +1647,27 @@ export default function VynzoraFloatingAssistant() {
             // User was speaking, now paused or finished
             if (silenceStartTime === 0) {
               silenceStartTime = Date.now();
-            } else if (Date.now() - silenceStartTime >= SILENCE_DURATION_MS) {
-              // Exactly 1.4 seconds of continuous silence after speech detected!
-              clearInterval(vadIntervalRef.current);
-              cleanupVAD();
-              onSilenceDetected();
-              return;
+              timingRef.current.userSpeechEndedAt = performance.now();
+            } else {
+              const currentTranscript = liveStreamingTranscriptRef.current || '';
+              const adaptiveSilenceMs = computeAdaptiveSilenceTimeoutMs(
+                currentTranscript,
+                isStreamingFinalRef.current
+              );
+              if (Date.now() - silenceStartTime >= adaptiveSilenceMs) {
+                // Adaptive endpoint triggered!
+                timingRef.current.endpointDetectedAt = performance.now();
+                const epDuration = Math.round(
+                  timingRef.current.endpointDetectedAt - timingRef.current.userSpeechEndedAt
+                );
+                console.log(
+                  `[Vynzora Latency] Adaptive speech endpoint triggered in ${epDuration}ms (threshold: ${adaptiveSilenceMs}ms, transcript: "${currentTranscript}")`
+                );
+                clearInterval(vadIntervalRef.current);
+                cleanupVAD();
+                onSilenceDetected();
+                return;
+              }
             }
           }
 
@@ -1508,6 +1741,7 @@ export default function VynzoraFloatingAssistant() {
 
         mediaRecorder.onstop = async () => {
           cleanupVAD();
+          stopLiveStreamingASR();
           // If in hands-free mode and no genuine human speech was confirmed in this slice
           if (!hasSpokenRef.current && isHandsFree) {
             console.log(
@@ -1548,6 +1782,9 @@ export default function VynzoraFloatingAssistant() {
         setIsRecording(true);
         setRecordSeconds(0);
 
+        // Start live streaming speech recognition to recognize words while user is speaking
+        startLiveStreamingASR();
+
         const micLatency = Math.round(performance.now() - timingRef.current.micStartedAt);
         console.log(`[Vynzora Diagnostic] Microphone activated and recording started in ${micLatency}ms (hands-free: ${isHandsFree})`);
 
@@ -1563,7 +1800,35 @@ export default function VynzoraFloatingAssistant() {
               // Silence detected after speech -> automatically stop and send!
               if (!isSubmittingRef.current) {
                 isSubmittingRef.current = true;
-                console.log('[Vynzora Diagnostic] Recording completed (silence detected after speech)');
+                timingRef.current.endpointDetectedAt = performance.now();
+                const epDuration = timingRef.current.userSpeechEndedAt
+                  ? Math.round(timingRef.current.endpointDetectedAt - timingRef.current.userSpeechEndedAt)
+                  : 0;
+                console.log(`[Vynzora Latency] Endpoint triggered in ${epDuration}ms after speech ended`);
+
+                stopLiveStreamingASR();
+
+                const verifiedText = (liveStreamingTranscriptRef.current || '').trim();
+                const words = verifiedText.split(/\s+/).filter(Boolean);
+                const isCommandWord = /^(wait|stop|listen|cancel|hello|help|pause|hold\s*on|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|രുക്കോ|रुको|सुनो)$/i.test(
+                  verifiedText
+                );
+
+                // FAST PATH: If verified speech was recognized via live streaming ASR,
+                // submit directly to AI chat endpoint, bypassing the 2-second Sarvam cloud STT upload!
+                if ((words.length >= 2 || isCommandWord) && verifiedText.length >= 3) {
+                  console.log(
+                    `[Vynzora Latency] Fast-path active: Submitting recognized transcript "${verifiedText}" directly to AI agent! (Bypassed Sarvam upload delay)`
+                  );
+                  stopRecording();
+                  liveStreamingTranscriptRef.current = '';
+                  isStreamingFinalRef.current = false;
+                  handleSendMessage(verifiedText);
+                  return;
+                }
+
+                // Fallback: stop recorder and process raw audioBlob via Sarvam Saaras v3 STT
+                console.log('[Vynzora Diagnostic] Streaming transcript unverified or empty; falling back to Sarvam STT audio upload.');
                 stopRecording();
               }
             },
@@ -1580,6 +1845,7 @@ export default function VynzoraFloatingAssistant() {
       } catch (err: any) {
         console.error('[Vynzora Diagnostic] Microphone access failed:', err.message || err);
         setErrorMessage('Microphone access denied: ' + (err.message || 'Please check microphone permissions.'));
+        stopLiveStreamingASR();
         isRecordingRef.current = false;
         setIsRecording(false);
         setIsManualRecording(false);
@@ -1588,7 +1854,7 @@ export default function VynzoraFloatingAssistant() {
         startWakeWordListeningRef.current?.();
       }
     },
-    [stopAudio, cleanupVAD, processVoiceBlob, setupVAD, stopRecording]
+    [stopAudio, cleanupVAD, processVoiceBlob, setupVAD, stopRecording, startLiveStreamingASR, stopLiveStreamingASR, handleSendMessage]
   );
   startRecordingRef.current = startRecording;
 
