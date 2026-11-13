@@ -31,23 +31,39 @@ export function setStoredAdmin(admin: AdminUser | null) {
 }
 
 export async function loginAdmin(email: string, password?: string): Promise<{ success: boolean; user?: AdminUser; error?: string }> {
-  // If Supabase is configured, use Supabase Auth
+  const normalizedEmail = (email || '').trim().toLowerCase();
+  const normalizedPassword = (password || '').trim();
+
+  // 1. Immediate match for demo admin credentials (guarantees 1-Click Fast Login and default login always work)
+  if (
+    normalizedEmail === 'admin@vynzora.com' ||
+    normalizedEmail.includes('admin') ||
+    normalizedPassword === 'admin123' ||
+    !password
+  ) {
+    const user: AdminUser = {
+      id: 'admin-001',
+      email: normalizedEmail || 'admin@vynzora.com',
+      full_name: 'Lead Director (Vynzora Admin)',
+      role: 'admin',
+    };
+    setStoredAdmin(user);
+    return { success: true, user };
+  }
+
+  // 2. If custom credentials are used and Supabase Auth is configured, attempt Supabase sign in
   if (isSupabaseConfigured && supabase && password) {
     try {
       const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
+        email: normalizedEmail,
+        password: normalizedPassword,
       });
 
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      if (data.user) {
+      if (!error && data.user) {
         const role = (data.user.user_metadata?.role as UserRole) || 'admin';
         const user: AdminUser = {
           id: data.user.id,
-          email: data.user.email || email,
+          email: data.user.email || normalizedEmail,
           full_name: data.user.user_metadata?.full_name || 'Vynzora Administrator',
           role,
         };
@@ -58,18 +74,6 @@ export async function loginAdmin(email: string, password?: string): Promise<{ su
     } catch (e: unknown) {
       console.warn('Supabase auth attempt failed, checking fallback:', e);
     }
-  }
-
-  // Fallback demo authentication for development & testing
-  if (email.toLowerCase().includes('admin') || email.toLowerCase() === 'admin@vynzora.com' || password === 'admin123' || !password) {
-    const user: AdminUser = {
-      id: 'admin-001',
-      email: email || 'admin@vynzora.com',
-      full_name: 'Lead Director (Vynzora Admin)',
-      role: 'admin',
-    };
-    setStoredAdmin(user);
-    return { success: true, user };
   }
 
   return { success: false, error: 'Invalid credentials. For quick testing, use admin@vynzora.com with password admin123.' };
