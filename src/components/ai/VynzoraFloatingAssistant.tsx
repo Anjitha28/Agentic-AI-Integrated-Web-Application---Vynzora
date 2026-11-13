@@ -52,9 +52,15 @@ export type AssistantVoiceState =
 // Natural Speech Detection Parameters
 const SILENCE_DURATION_MS = 1400; // 1.4s of continuous natural silence after speech -> auto-submit immediately
 const SPEECH_VOLUME_THRESHOLD = 14; // RMS amplitude threshold for human speech
-const INTERRUPT_VOLUME_THRESHOLD = 24; // RMS amplitude threshold for barge-in voice interruption
 const MIN_SPEECH_DURATION_MS = 250; // Minimum 250ms of speech before silence detection arms
 const MAX_RECORDING_TIMEOUT_MS = 25000; // 25s max safety window per utterance
+
+// Configurable Audio Priority & Real-Time Interruption (Barge-In) Parameters
+const MIN_BARGE_IN_SNR_DB = 12; // Signal-to-noise ratio in dB above ambient noise required for speech
+const MIN_BARGE_IN_RMS = 26; // Minimum absolute RMS amplitude required for speech
+const MIN_VOICE_BAND_RATIO = 0.48; // At least 48% of spectral energy must reside in human vocal range (300Hz-3400Hz)
+const MIN_BARGE_IN_SPEECH_DURATION_MS = 380; // User speech must be sustained for at least 380ms to avoid transient spikes/clicks
+const SPEECH_CONFIDENCE_THRESHOLD = 0.55; // Web Speech confidence score required to interrupt
 
 // Sleep/stop commands during active conversation
 const SLEEP_WORD_REGEX =
@@ -150,6 +156,43 @@ export function matchWakeWord(rawTranscript: string): {
   return { matched: false, normalized, reason: 'no_wake_phrase' };
 }
 
+/**
+ * Detects whether incoming microphone transcription is self-echo from the
+ * assistant's own TTS voice output playing through the room/laptop speakers.
+ * Prevents the assistant from prematurely cutting itself off.
+ */
+export function isSelfEcho(incomingRaw: string, assistantSpokenText: string): boolean {
+  if (!incomingRaw || !assistantSpokenText) return false;
+  const incNorm = normalizeSpeechText(incomingRaw);
+  const ttsNorm = normalizeSpeechText(assistantSpokenText);
+  if (!incNorm || !ttsNorm) return false;
+
+  // 1. Direct exact or substring inclusion
+  if (ttsNorm.includes(incNorm)) {
+    return true;
+  }
+
+  // 2. Word-level overlap: if the incoming words mostly match the assistant's speech
+  const incWords = incNorm.split(/\s+/).filter((w) => w.length > 2);
+  if (incWords.length === 0) return false;
+
+  const ttsWords = new Set(ttsNorm.split(/\s+/));
+  let matchCount = 0;
+  for (const w of incWords) {
+    if (ttsWords.has(w)) {
+      matchCount++;
+    }
+  }
+
+  const overlapRatio = matchCount / incWords.length;
+  // If 70% or more of the words heard by the mic are words from the assistant's current utterance
+  if (overlapRatio >= 0.70) {
+    return true;
+  }
+
+  return false;
+}
+
 export default function VynzoraFloatingAssistant() {
   const [isOpen, setIsOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -198,6 +241,22 @@ export default function VynzoraFloatingAssistant() {
   const stopRecordingRef = useRef<(() => void) | undefined>(undefined);
   const startWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
   const stopWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
+
+  // Audio Priority & Self-Echo Rejection Tracking
+  const currentAssistantSpeechTextRef = useRef<string>(''); // Currently playing TTS text
+  const acousticMetricsRef = useRef<{
+    noiseFloor: number;
+    currentRms: number;
+    snr: number;
+    voiceBandRatio: number;
+    sustainedDurationMs: number;
+  }>({
+    noiseFloor: 16,
+    currentRms: 0,
+    snr: 0,
+    voiceBandRatio: 0,
+    sustainedDurationMs: 0,
+  });
 
   // Refs for Hands-Free Wake-Word & VAD
   const wakeWordRecRef = useRef<any>(null);
@@ -378,7 +437,7 @@ export default function VynzoraFloatingAssistant() {
     [stopAudio]
   );
 
-  // Monitors acoustic volume during speech playback for zero-latency voice interruption
+  // Adaptive acoustic Voice Activity Detector & SNR Tracker during speech playback
   const setupInterruptionVAD = useCallback(
     (stream: MediaStream) => {
       try {
@@ -398,7 +457,8 @@ export default function VynzoraFloatingAssistant() {
         source.connect(analyser);
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        let bargeInSpeechMs = 0;
+        let sustainedVoiceMs = 0;
+        let noiseFloor = acousticMetricsRef.current.noiseFloor || 16;
 
         interruptionVadIntervalRef.current = setInterval(() => {
           if (!isPlayingAudioRef.current) {
@@ -407,38 +467,65 @@ export default function VynzoraFloatingAssistant() {
           }
 
           analyser.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
-          const avg = sum / dataArray.length;
 
-          // With echoCancellation enabled, speaker audio is suppressed.
-          // User speaking into mic creates volume spikes above INTERRUPT_VOLUME_THRESHOLD:
-          if (avg >= INTERRUPT_VOLUME_THRESHOLD) {
-            bargeInSpeechMs += 60;
-            if (bargeInSpeechMs >= 120) {
-              console.log(
-                `[Vynzora Diagnostic] Acoustic voice activity detected during playback (${Math.round(avg)} RMS)! Interrupting.`
-              );
-              cleanupInterruptionVAD();
-              interruptPlayback('acoustic voice barge-in');
-            }
-          } else {
-            bargeInSpeechMs = Math.max(0, bargeInSpeechMs - 40);
+          // 1. Overall acoustic energy
+          let sumTotal = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sumTotal += dataArray[i];
           }
-        }, 60);
+          const avgTotal = sumTotal / dataArray.length;
+
+          // 2. Human vocal band energy (approx 300Hz - 3400Hz, bins 3 to 36 with 512 FFT at 48kHz)
+          let voiceBandSum = 0;
+          for (let i = 3; i <= 36; i++) {
+            voiceBandSum += dataArray[i];
+          }
+          const voiceBandAvg = voiceBandSum / 34;
+          const voiceBandRatio = voiceBandAvg / (avgTotal || 1);
+
+          // 3. Adaptive noise floor calibration
+          if (avgTotal < noiseFloor) {
+            noiseFloor = noiseFloor * 0.85 + avgTotal * 0.15;
+          } else {
+            noiseFloor = noiseFloor * 0.98 + avgTotal * 0.02;
+          }
+
+          // 4. Signal-to-Noise Ratio (difference over ambient baseline)
+          const snr = Math.max(0, avgTotal - noiseFloor);
+
+          // 5. Genuine human speech profile:
+          // Must exceed noise floor by MIN_BARGE_IN_SNR_DB, meet minimum RMS, and concentrate energy in vocal band
+          const isHumanVocal =
+            avgTotal >= MIN_BARGE_IN_RMS &&
+            snr >= MIN_BARGE_IN_SNR_DB &&
+            voiceBandRatio >= MIN_VOICE_BAND_RATIO;
+
+          if (isHumanVocal) {
+            sustainedVoiceMs += 50;
+          } else {
+            sustainedVoiceMs = Math.max(0, sustainedVoiceMs - 40);
+          }
+
+          acousticMetricsRef.current = {
+            noiseFloor,
+            currentRms: avgTotal,
+            snr,
+            voiceBandRatio,
+            sustainedDurationMs: sustainedVoiceMs,
+          };
+        }, 50);
       } catch (e: any) {
         console.warn('[Vynzora Diagnostic] Could not setup interruption VAD:', e.message || e);
       }
     },
-    [cleanupInterruptionVAD, interruptPlayback]
+    [cleanupInterruptionVAD]
   );
 
   // Transition after assistant response audio completes
   // User asks -> Agent responds -> Automatically restart listening -> User asks again
   const handleResponseAudioFinished = useCallback(() => {
     cleanupInterruptionVAD();
+    currentAssistantSpeechTextRef.current = '';
     if (!isWakeWordEnabledRef.current) {
       setVoiceState('DISABLED');
       voiceStateRef.current = 'DISABLED';
@@ -453,12 +540,13 @@ export default function VynzoraFloatingAssistant() {
     startRecordingRef.current?.(true);
   }, [cleanupInterruptionVAD]);
 
-  // Play audio from base64 string with onEnded callback & barge-in support
+  // Play audio from base64 string with onEnded callback & complete delivery guarantee
   const playAudioBase64 = useCallback(
-    (base64Audio: string, onEnded?: () => void) => {
+    (base64Audio: string, onEnded?: () => void, textSpoken?: string) => {
       try {
         stopAudio();
         const activeRequestId = currentRequestIdRef.current;
+        currentAssistantSpeechTextRef.current = textSpoken || '';
 
         const byteCharacters = atob(base64Audio);
         const byteNumbers = new Array(byteCharacters.length);
@@ -479,7 +567,9 @@ export default function VynzoraFloatingAssistant() {
         voiceStateRef.current = 'SPEAKING';
 
         timingRef.current.playStartedAt = performance.now();
-        console.log('[Vynzora Diagnostic] Voice playback started (Barge-In enabled)');
+        console.log(
+          `[Vynzora Diagnostic] Voice playback started (${textSpoken ? `"${textSpoken.slice(0, 70)}..."` : 'audio'}) - Complete playback prioritized`
+        );
 
         // Enable acoustic interruption detection while audio is playing
         if (mediaStreamRef.current && mediaStreamRef.current.active) {
@@ -488,13 +578,14 @@ export default function VynzoraFloatingAssistant() {
 
         const finishPlayback = () => {
           cleanupInterruptionVAD();
+          currentAssistantSpeechTextRef.current = '';
           if (activeRequestId !== currentRequestIdRef.current) {
             console.log('[Vynzora Diagnostic] Request was interrupted, discarding finish callback');
             return;
           }
           timingRef.current.playEndedAt = performance.now();
           const duration = Math.round(timingRef.current.playEndedAt - timingRef.current.playStartedAt);
-          console.log(`[Vynzora Diagnostic] Voice playback completed in ${duration}ms`);
+          console.log(`[Vynzora Diagnostic] Complete voice response delivered successfully in ${duration}ms`);
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
           // 250ms acoustic buffer
@@ -513,6 +604,7 @@ export default function VynzoraFloatingAssistant() {
         audio.onerror = (e) => {
           console.error('[Vynzora Diagnostic] Audio element playback error:', e);
           cleanupInterruptionVAD();
+          currentAssistantSpeechTextRef.current = '';
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
           handleResponseAudioFinished();
@@ -521,6 +613,7 @@ export default function VynzoraFloatingAssistant() {
         audio.play().catch((err) => {
           console.warn('[Vynzora Diagnostic] Audio playback interrupted or blocked:', err);
           cleanupInterruptionVAD();
+          currentAssistantSpeechTextRef.current = '';
           isPlayingAudioRef.current = false;
           setIsPlayingAudio(false);
           handleResponseAudioFinished();
@@ -528,6 +621,7 @@ export default function VynzoraFloatingAssistant() {
       } catch (e) {
         console.error('[Vynzora Diagnostic] Failed to play audio:', e);
         cleanupInterruptionVAD();
+        currentAssistantSpeechTextRef.current = '';
         isPlayingAudioRef.current = false;
         setIsPlayingAudio(false);
         handleResponseAudioFinished();
@@ -551,6 +645,7 @@ export default function VynzoraFloatingAssistant() {
       const greetingText = isFirstActivation
         ? "Hello! I'm Zora, your Vynzora AI assistant. How can I help you today?"
         : "Yes, I'm listening! How can I help?";
+      currentAssistantSpeechTextRef.current = greetingText;
 
       console.log(`[Vynzora Diagnostic] Playing wake greeting (first: ${isFirstActivation}): "${greetingText}"`);
 
@@ -565,6 +660,7 @@ export default function VynzoraFloatingAssistant() {
 
       const finishGreeting = () => {
         cleanupInterruptionVAD();
+        currentAssistantSpeechTextRef.current = '';
         if (activeRequestId !== currentRequestIdRef.current) return;
         isPlayingAudioRef.current = false;
         setIsPlayingAudio(false);
@@ -718,7 +814,7 @@ export default function VynzoraFloatingAssistant() {
 
         // Synthesize voice reply if spoken or hands-free
         if (data.audio_base64) {
-          playAudioBase64(data.audio_base64);
+          playAudioBase64(data.audio_base64, () => handleResponseAudioFinished(), data.response);
         } else {
           handleResponseAudioFinished();
         }
@@ -876,7 +972,7 @@ export default function VynzoraFloatingAssistant() {
         if (data.audio_base64) {
           playAudioBase64(data.audio_base64, () => {
             handleResponseAudioFinished();
-          });
+          }, data.response);
         } else {
           handleResponseAudioFinished();
         }
@@ -1030,6 +1126,24 @@ export default function VynzoraFloatingAssistant() {
 
         mediaRecorder.onstop = async () => {
           cleanupVAD();
+          // If in hands-free mode and no genuine human speech was confirmed, recycle buffer without submitting empty audio
+          if (!hasSpokenRef.current && isHandsFree) {
+            console.log(
+              '[Vynzora Diagnostic] No genuine user speech in recording buffer; recycling continuous listening session'
+            );
+            audioChunksRef.current = [];
+            isRecordingRef.current = false;
+            setIsRecording(false);
+            if (
+              isWakeWordEnabledRef.current &&
+              (voiceStateRef.current === 'CONTINUOUS_LISTENING' || voiceStateRef.current === 'LISTENING')
+            ) {
+              setTimeout(() => {
+                startRecordingRef.current?.(true);
+              }, 150);
+            }
+            return;
+          }
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
           // Note: DO NOT stop audio tracks! Keep mediaStreamRef.current alive for continuous interaction!
           await processVoiceBlob(audioBlob);
@@ -1215,25 +1329,42 @@ export default function VynzoraFloatingAssistant() {
         }
 
         // Real-Time Barge-In Detection: User speaking while AI is speaking
+        // Full voice response delivery is prioritized. Interruption occurs ONLY when:
+        // 1. Incoming speech is NOT self-echo from assistant's own TTS output.
+        // 2. Clear human voice is recognized with high confidence and meaningful content.
+        // 3. Acoustic VAD confirms energy in human vocal band (300Hz-3400Hz) with high SNR.
         if (isPlayingAudioRef.current) {
           for (let i = event.resultIndex; i < event.results.length; i++) {
             for (let a = 0; a < event.results[i].length; a++) {
               const rawTranscript = event.results[i][a].transcript;
+              const confidence = event.results[i][a].confidence;
               if (!rawTranscript || !rawTranscript.trim()) continue;
 
-              const wakeCheck = matchWakeWord(rawTranscript);
+              const trimmed = rawTranscript.trim();
+
+              // 1. Filter out self-echo (assistant's own TTS playing out of room/device speakers)
+              if (isSelfEcho(trimmed, currentAssistantSpeechTextRef.current)) {
+                console.log(
+                  `[Vynzora Diagnostic] Discarding self-echo from assistant voice playback: "${trimmed}"`
+                );
+                continue;
+              }
+
+              // 2. Explicit Wake Word Check ("Hey Zora" / "Hey Zorah")
+              const wakeCheck = matchWakeWord(trimmed);
               if (wakeCheck.matched) {
-                console.log(`[Vynzora Diagnostic] "Hey Zora" interruption during playback: "${rawTranscript}"`);
+                console.log(`[Vynzora Diagnostic] "Hey Zora" wake-word interruption during playback: "${trimmed}"`);
                 try {
                   rec.abort();
                 } catch {}
                 wakeWordRecRef.current = null;
-                handleWakeWordTriggered(rawTranscript);
+                handleWakeWordTriggered(trimmed);
                 return;
               }
 
-              if (SLEEP_WORD_REGEX.test(rawTranscript)) {
-                console.log(`[Vynzora Diagnostic] Sleep command interruption during playback: "${rawTranscript}"`);
+              // 3. Explicit Sleep / Stop Command Check ("Stop", "Sleep", "Cancel", "മതി", "ശരി മതി", "रुको")
+              if (SLEEP_WORD_REGEX.test(trimmed)) {
+                console.log(`[Vynzora Diagnostic] Sleep command interruption during playback: "${trimmed}"`);
                 try {
                   rec.abort();
                 } catch {}
@@ -1242,16 +1373,45 @@ export default function VynzoraFloatingAssistant() {
                 return;
               }
 
-              // Any other spoken user voice during playback -> Immediate Barge-In!
-              if (rawTranscript.trim().length >= 2) {
-                console.log(`[Vynzora Diagnostic] Barge-in speech detected during playback: "${rawTranscript}"`);
-                try {
-                  rec.abort();
-                } catch {}
-                wakeWordRecRef.current = null;
-                interruptPlayback('voice barge-in');
-                return;
+              // 4. Genuine User Speech Interruption Validation:
+              // Condition A: Speech Confidence Verification
+              if (confidence !== undefined && confidence > 0 && confidence < SPEECH_CONFIDENCE_THRESHOLD) {
+                console.log(
+                  `[Vynzora Diagnostic] Interruption rejected: Low confidence (${confidence.toFixed(2)} < ${SPEECH_CONFIDENCE_THRESHOLD}): "${trimmed}"`
+                );
+                continue;
               }
+
+              // Condition B: Minimum meaningful phrase length / recognized command word
+              // Filters out brief noises or one-letter clicks like "a", "oh", "um", "the", etc.
+              const words = trimmed.split(/\s+/).filter(Boolean);
+              const isCommandWord = /^(wait|stop|listen|cancel|hello|help|pause|നിൽക്കൂ|കേൾക്കൂ|ശരി|മതി|ശരി\s+മതി|रुको|सुनो)$/i.test(
+                trimmed
+              );
+              if (words.length < 2 && !isCommandWord) {
+                console.log(`[Vynzora Diagnostic] Interruption rejected: Fragmentary noise/single-word: "${trimmed}"`);
+                continue;
+              }
+
+              // Condition C: Acoustic Signal-to-Noise Ratio & Vocal Band Verification
+              const metrics = acousticMetricsRef.current;
+              if (metrics.snr < 10 && metrics.currentRms < 28) {
+                console.log(
+                  `[Vynzora Diagnostic] Interruption rejected: Insufficient voice SNR (${metrics.snr.toFixed(1)} dB < 10 dB): "${trimmed}"`
+                );
+                continue;
+              }
+
+              // ALL CONDITIONS SATISFIED: Genuine human speech interruption confirmed!
+              console.log(
+                `[Vynzora Diagnostic] Confirmed genuine user voice interruption: "${trimmed}" (SNR: ${metrics.snr.toFixed(1)} dB, Ratio: ${(metrics.voiceBandRatio * 100).toFixed(0)}%, Confidence: ${confidence !== undefined ? confidence.toFixed(2) : 'N/A'})`
+              );
+              try {
+                rec.abort();
+              } catch {}
+              wakeWordRecRef.current = null;
+              interruptPlayback(`confirmed human voice barge-in: "${trimmed}"`);
+              return;
             }
           }
           return;

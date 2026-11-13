@@ -70,6 +70,7 @@ async def chat_endpoint(payload: ChatRequest):
     Text Chat Endpoint:
     Sends user message to Gemini Agent (gemini-3.5-flash-lite) with native Supabase tool execution.
     Maintains persistent multi-turn chat history via session_id.
+    Synthesizes and returns gTTS speech audio so voice playback is always complete.
     """
     if not payload.message or not payload.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
@@ -80,10 +81,26 @@ async def chat_endpoint(payload: ChatRequest):
             session_id=payload.session_id,
             detected_language=payload.language
         )
+        ai_text = result["response"]
+        detected_lang = result.get("detected_language") or payload.language or "en-IN"
+
+        # Generate complete gTTS voice audio so voice output is always available
+        audio_base64 = None
+        try:
+            audio_mp3_bytes = generate_speech_audio(
+                text=ai_text,
+                detected_language=detected_lang
+            )
+            audio_base64 = base64.b64encode(audio_mp3_bytes).decode("utf-8")
+        except Exception as tts_err:
+            logger.warning(f"Could not synthesize speech audio in /agent/chat: {tts_err}")
+
         return {
             "status": "success",
-            "response": result["response"],
-            "session_id": result["session_id"]
+            "response": ai_text,
+            "session_id": result["session_id"],
+            "detected_language": detected_lang,
+            "audio_base64": audio_base64
         }
     except Exception as e:
         logger.error(f"Error in /agent/chat: {e}", exc_info=True)
