@@ -93,12 +93,24 @@ class GeminiAgentManager:
     """
     Manages stateful Gemini Chat sessions with native tool execution.
     Maintains persistent multi-turn conversational context across text and voice turns.
+    Supports asynchronous cancellation of in-flight response generation.
     """
 
     def __init__(self):
         config.validate_config()
         self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         self.sessions: Dict[str, Any] = {}
+        self.session_request_ids: Dict[str, int] = {}
+
+    def cancel_session(self, session_id: str) -> None:
+        """
+        Immediately cancels ongoing Gemini generation for this session
+        by invalidating the active request ID.
+        """
+        if session_id:
+            curr = self.session_request_ids.get(session_id, 0)
+            self.session_request_ids[session_id] = curr + 1
+            logger.info(f"[Session {session_id}] Real-time interruption: Request #{curr} cancelled.")
 
     def get_or_create_chat(self, session_id: Optional[str] = None) -> tuple[Any, str]:
         """
@@ -129,8 +141,11 @@ class GeminiAgentManager:
     ) -> Dict[str, Any]:
         """
         Sends a message to the Gemini Agent and executes any required database tools natively.
+        Checks for cancellation before and after generation.
         """
         chat, active_session_id = self.get_or_create_chat(session_id)
+        current_req_id = self.session_request_ids.get(active_session_id, 0) + 1
+        self.session_request_ids[active_session_id] = current_req_id
 
         # If a specific language code was detected from voice (e.g. ml-IN, hi-IN),
         # include language context guidance as in the Colab notebook.
@@ -146,13 +161,26 @@ User question:
         else:
             prompt = message
 
-        logger.info(f"[Session {active_session_id}] Processing user prompt: '{message}'")
+        logger.info(f"[Session {active_session_id}] Processing user prompt (req #{current_req_id}): '{message}'")
         response = chat.send_message(prompt)
+
+        # Check if user interrupted while Gemini was executing tools or generating text
+        if self.session_request_ids.get(active_session_id) != current_req_id:
+            logger.info(f"[Session {active_session_id}] Discarding Gemini response for interrupted req #{current_req_id}")
+            return {
+                "status": "cancelled",
+                "response": "",
+                "session_id": active_session_id,
+                "cancelled": True
+            }
+
         ai_text = response.text or ""
 
         return {
+            "status": "success",
             "response": ai_text,
-            "session_id": active_session_id
+            "session_id": active_session_id,
+            "cancelled": False
         }
 
 # Global singleton

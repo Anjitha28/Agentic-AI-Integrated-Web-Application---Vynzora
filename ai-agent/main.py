@@ -42,6 +42,9 @@ class SpeakRequest(BaseModel):
     text: str
     language: Optional[str] = "en-IN"
 
+class CancelRequest(BaseModel):
+    session_id: str
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -64,6 +67,16 @@ def health_check():
     }
 
 
+@app.post("/agent/cancel")
+async def cancel_endpoint(payload: CancelRequest):
+    """
+    Cancels in-flight Gemini generation & prevents late TTS synthesis
+    when the user interrupts the assistant.
+    """
+    agent_manager.cancel_session(payload.session_id)
+    return {"status": "success", "session_id": payload.session_id}
+
+
 @app.post("/agent/chat")
 async def chat_endpoint(payload: ChatRequest):
     """
@@ -81,6 +94,15 @@ async def chat_endpoint(payload: ChatRequest):
             session_id=payload.session_id,
             detected_language=payload.language
         )
+
+        if result.get("cancelled"):
+            return {
+                "status": "cancelled",
+                "response": "",
+                "session_id": result["session_id"],
+                "audio_base64": None
+            }
+
         ai_text = result["response"]
         detected_lang = result.get("detected_language") or payload.language or "en-IN"
 
@@ -146,6 +168,17 @@ async def voice_endpoint(
             session_id=session_id,
             detected_language=detected_lang
         )
+
+        if result.get("cancelled"):
+            return {
+                "status": "cancelled",
+                "transcript": transcript,
+                "detected_language": detected_lang,
+                "response": "",
+                "audio_base64": None,
+                "session_id": result["session_id"]
+            }
+
         ai_text = result["response"]
         active_session_id = result["session_id"]
 
