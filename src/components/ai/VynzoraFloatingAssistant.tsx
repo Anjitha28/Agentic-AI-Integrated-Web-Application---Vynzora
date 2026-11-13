@@ -74,7 +74,8 @@ const SUGGESTED_PROMPTS = [
  * - Lowercases text.
  * - Strips punctuation and symbols without eating spaces.
  * - Standardizes acronyms ("a.i.", "a. i.", "a i", "eye", "aye") -> "ai" preserving boundaries.
- * - Maps phonetic/accent variations ("zorah", "zoro", "sora", "jora", "xora") -> "zora".
+ * - Maps greeting prefix variations ("hay", "ay", "ey", "he", "eh") -> "hey".
+ * - Maps phonetic/accent variations ("zorah", "zoro", "sora", "zara", "zura", "zola", "zoya", "jora", "xora", "czora", "torah") -> "zora".
  * - Normalizes multiple spaces to a single space.
  */
 export function normalizeSpeechText(raw: string): string {
@@ -89,17 +90,21 @@ export function normalizeSpeechText(raw: string): string {
   text = text.replace(/\ba\s+i\b/g, 'ai');
   text = text.replace(/\b(eye|aye)\b/g, 'ai');
 
-  // 3. Normalize phonetic variations of zora: zorah, zoro, sora, jora, xora
-  text = text.replace(/\b(zorah|zoro|sora|jora|xora)\b/g, 'zora');
+  // 3. Normalize greeting prefix variations (hay, ay, ey, he, eh) -> hey
+  text = text.replace(/\b(hay|ay|ey|he|eh)\b/g, 'hey');
 
-  // 4. Collapse consecutive whitespace
+  // 4. Normalize phonetic variations of zora:
+  // zorah, zoro, sora, zara, zura, zola, zoya, jora, xora, czora, torah
+  text = text.replace(/\b(zorah|zoro|sora|zara|zura|zola|zoya|jora|xora|czora|torah?)\b/g, 'zora');
+
+  // 5. Collapse consecutive whitespace
   text = text.replace(/\s+/g, ' ').trim();
   return text;
 }
 
 /**
  * Robust, low-latency wake-word matcher:
- * - Accepts ONLY the configured wake phrase: "Hey Zora" (and variations: "Hey Zorah", "ഹേയ് സോറ", "हाय ज़ोरा").
+ * - Accepts ONLY the configured wake phrase: "Hey Zora" (and variations: "Hey Zorah", "Hey Zora AI", "ഹേയ് സോറ", "हाय ज़ोरा").
  * - Strictly rejects "Hey", "Hey Siri", "Siri", "Alexa", "Google", "Hey Vynzora AI", "Vynzora AI".
  * - Handles natural accents, pronunciation variations, and trailing queries.
  */
@@ -108,37 +113,41 @@ export function matchWakeWord(rawTranscript: string): {
   phrase?: string;
   trailingQuery?: string;
   normalized?: string;
+  reason?: string;
 } {
+  if (!rawTranscript) return { matched: false, reason: 'empty_transcript' };
   const normalized = normalizeSpeechText(rawTranscript);
 
   // Explicit negative check: strictly reject other voice assistants & prior wake words
   if (/\b(siri|hey siri|google|alexa|cortana|vynzora)\b/i.test(normalized)) {
-    return { matched: false, normalized };
+    return { matched: false, normalized, reason: 'rejected_competing_assistant' };
   }
 
-  // The ONLY supported English wake word: "Hey Zora" (and phonetic variations like "Hey Zorah")
-  const wakePattern = /\bhey\s+zora\b/i;
-  // Indic script pattern: Malayalam "ഹേയ് സോറ" / "ഹേ സോറ", Hindi "हाय ज़ोरा" / "हे ज़ोरा"
-  const mlHiPattern = /(?:^|\s)(ഹേയ്\s*സോറ|ഹേ\s*സോറ|हाय\s*ज़ोरा|हे\s*ज़ोरा)(?:$|\s)/i;
+  // English wake pattern: 'hey zora' or 'hey zora ai'
+  const wakePattern = /\bhey\s+zora(\s+ai)?\b/i;
+  // Indic script pattern (Malayalam & Hindi, optionally with AI)
+  const mlHiPattern = /(?:^|\s)(ഹേയ്\s*സോറ(\s*ai)?|ഹേ\s*സോറ(\s*ai)?|हाय\s*ज़ोरा(\s*ai)?|हे\s*ज़ोरा(\s*ai)?|हाय\s*जोरा(\s*ai)?|हे\s*जोरा(\s*ai)?)(?:$|\s)/i;
 
   let match = normalized.match(wakePattern);
   if (!match) {
     const padded = ` ${normalized} `;
     const mlMatch = padded.match(mlHiPattern);
     if (mlMatch) {
-      const phrase = mlMatch[1];
+      const phrase = mlMatch[1].trim();
       const idx = normalized.indexOf(phrase);
-      const trailingQuery = idx >= 0 ? normalized.slice(idx + phrase.length).trim() : '';
+      let trailingQuery = idx >= 0 ? normalized.slice(idx + phrase.length).trim() : '';
+      trailingQuery = trailingQuery.replace(/^ai\b/i, '').trim();
       return { matched: true, phrase, trailingQuery, normalized };
     }
   } else if (match && match.index !== undefined) {
-    const phrase = match[0];
+    const phrase = match[0].trim();
     const idxAfterWake = match.index + phrase.length;
-    const trailingQuery = normalized.slice(idxAfterWake).trim();
+    let trailingQuery = normalized.slice(idxAfterWake).trim();
+    trailingQuery = trailingQuery.replace(/^ai\b/i, '').trim();
     return { matched: true, phrase, trailingQuery, normalized };
   }
 
-  return { matched: false, normalized };
+  return { matched: false, normalized, reason: 'no_wake_phrase' };
 }
 
 export default function VynzoraFloatingAssistant() {
@@ -188,6 +197,7 @@ export default function VynzoraFloatingAssistant() {
   const startRecordingRef = useRef<((isHandsFree?: boolean) => Promise<void>) | undefined>(undefined);
   const stopRecordingRef = useRef<(() => void) | undefined>(undefined);
   const startWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
+  const stopWakeWordListeningRef = useRef<(() => void) | undefined>(undefined);
 
   // Refs for Hands-Free Wake-Word & VAD
   const wakeWordRecRef = useRef<any>(null);
@@ -1067,7 +1077,7 @@ export default function VynzoraFloatingAssistant() {
         setIsManualRecording(false);
         setVoiceState('WAKE_WORD_STANDBY');
         voiceStateRef.current = 'WAKE_WORD_STANDBY';
-        startWakeWordListening();
+        startWakeWordListeningRef.current?.();
       }
     },
     [stopAudio, cleanupVAD, processVoiceBlob, setupVAD, stopRecording]
@@ -1081,8 +1091,10 @@ export default function VynzoraFloatingAssistant() {
         wakeWordRecRef.current.abort();
       } catch {}
       wakeWordRecRef.current = null;
+      console.log('[Vynzora Diagnostic] Wake-word listening stopped');
     }
   }, []);
+  stopWakeWordListeningRef.current = stopWakeWordListening;
 
   // Called when "Hey Zora" is spoken
   const handleWakeWordTriggered = useCallback(
@@ -1104,7 +1116,8 @@ export default function VynzoraFloatingAssistant() {
       // Check if a question was spoken in the exact same phrase
       // (e.g. "Hey Zora, how many enquiries do we have?")
       const wakeMatch = matchWakeWord(detectedTranscript);
-      const queryAfterWake = wakeMatch.trailingQuery?.trim() || '';
+      let queryAfterWake = wakeMatch.trailingQuery?.trim() || '';
+      queryAfterWake = queryAfterWake.replace(/^(ai|a\s+i)\b/i, '').trim();
 
       if (queryAfterWake.length >= 4) {
         // Direct query provided with wake word
@@ -1143,6 +1156,9 @@ export default function VynzoraFloatingAssistant() {
       isRecordingRef.current ||
       isLoadingRef.current
     ) {
+      console.log(
+        `[Vynzora Diagnostic] startWakeWordListening skipped (enabled: ${isWakeWordEnabledRef.current}, rec: ${isRecordingRef.current}, loading: ${isLoadingRef.current})`
+      );
       return;
     }
 
@@ -1161,6 +1177,7 @@ export default function VynzoraFloatingAssistant() {
         try {
           wakeWordRecRef.current.abort();
         } catch {}
+        wakeWordRecRef.current = null;
       }
 
       const rec = new SpeechRecognition();
@@ -1170,6 +1187,26 @@ export default function VynzoraFloatingAssistant() {
       rec.lang = 'en-US';
 
       timingRef.current.wakeListenStartedAt = performance.now();
+
+      rec.onstart = () => {
+        console.log('[Vynzora Diagnostic] SpeechRecognition engine started (listening for ONLY "Hey Zora")');
+      };
+
+      rec.onaudiostart = () => {
+        console.log('[Vynzora Diagnostic] Microphone audio capture active in speech engine');
+      };
+
+      rec.onspeechstart = () => {
+        console.log('[Vynzora Diagnostic] User speech detected on microphone');
+      };
+
+      rec.onspeechend = () => {
+        console.log('[Vynzora Diagnostic] User speech ended on microphone');
+      };
+
+      rec.onaudioend = () => {
+        console.log('[Vynzora Diagnostic] Audio stream paused in speech engine');
+      };
 
       rec.onresult = (event: any) => {
         // Echo prevention: Ignore during active recording or background AI request processing
@@ -1190,6 +1227,7 @@ export default function VynzoraFloatingAssistant() {
                 try {
                   rec.abort();
                 } catch {}
+                wakeWordRecRef.current = null;
                 handleWakeWordTriggered(rawTranscript);
                 return;
               }
@@ -1199,6 +1237,7 @@ export default function VynzoraFloatingAssistant() {
                 try {
                   rec.abort();
                 } catch {}
+                wakeWordRecRef.current = null;
                 playSleepResponse();
                 return;
               }
@@ -1209,6 +1248,7 @@ export default function VynzoraFloatingAssistant() {
                 try {
                   rec.abort();
                 } catch {}
+                wakeWordRecRef.current = null;
                 interruptPlayback('voice barge-in');
                 return;
               }
@@ -1230,6 +1270,13 @@ export default function VynzoraFloatingAssistant() {
             if (!rawTranscript || !rawTranscript.trim()) continue;
 
             const matchResult = matchWakeWord(rawTranscript);
+            console.log(
+              `[Vynzora Diagnostic] Recognized speech: "${rawTranscript}" (isFinal: ${event.results[i].isFinal}, alt: ${a}) -> ` +
+                (matchResult.matched
+                  ? `MATCHED ("${matchResult.phrase}")`
+                  : `REJECTED (${matchResult.reason || 'no match'})`)
+            );
+
             if (matchResult.matched && matchResult.phrase) {
               const detectLatency = Math.round(performance.now() - timingRef.current.wakeListenStartedAt);
               console.log(
@@ -1238,6 +1285,7 @@ export default function VynzoraFloatingAssistant() {
               try {
                 rec.abort();
               } catch {}
+              wakeWordRecRef.current = null;
               handleWakeWordTriggered(rawTranscript);
               return;
             }
@@ -1254,6 +1302,7 @@ export default function VynzoraFloatingAssistant() {
           try {
             rec.abort();
           } catch {}
+          wakeWordRecRef.current = null;
           handleWakeWordTriggered(cumulative);
           return;
         }
@@ -1261,12 +1310,13 @@ export default function VynzoraFloatingAssistant() {
 
       rec.onerror = (e: any) => {
         if (e.error !== 'no-speech' && e.error !== 'aborted') {
-          console.warn('[Vynzora Diagnostic] Wake word listener status:', e.error);
+          console.warn('[Vynzora Diagnostic] Wake word listener status/error:', e.error);
         }
       };
 
       rec.onend = () => {
-        // Automatically restart standby listening or speech monitoring
+        wakeWordRecRef.current = null;
+        // Automatically restart standby listening or speech monitoring with fresh instance
         if (
           isWakeWordEnabledRef.current &&
           !isRecordingRef.current &&
@@ -1274,10 +1324,15 @@ export default function VynzoraFloatingAssistant() {
           (voiceStateRef.current === 'WAKE_WORD_STANDBY' || voiceStateRef.current === 'SPEAKING')
         ) {
           setTimeout(() => {
-            try {
-              timingRef.current.wakeListenStartedAt = performance.now();
-              rec.start();
-            } catch {}
+            if (
+              isWakeWordEnabledRef.current &&
+              !isRecordingRef.current &&
+              !isLoadingRef.current &&
+              (voiceStateRef.current === 'WAKE_WORD_STANDBY' || voiceStateRef.current === 'SPEAKING')
+            ) {
+              console.log('[Vynzora Diagnostic] SpeechRecognition ended, restarting fresh listener instance...');
+              startWakeWordListeningRef.current?.();
+            }
           }, 150);
         }
       };
@@ -1324,7 +1379,7 @@ export default function VynzoraFloatingAssistant() {
             setMicPermission('granted');
             setVoiceState('WAKE_WORD_STANDBY');
             voiceStateRef.current = 'WAKE_WORD_STANDBY';
-            startWakeWordListening();
+            startWakeWordListeningRef.current?.();
           }
           return;
         }
@@ -1362,7 +1417,7 @@ export default function VynzoraFloatingAssistant() {
               setMicPermission('granted');
               setVoiceState('WAKE_WORD_STANDBY');
               voiceStateRef.current = 'WAKE_WORD_STANDBY';
-              startWakeWordListening();
+              startWakeWordListeningRef.current?.();
             }
           } catch (e: any) {
             if (mounted && (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError')) {
@@ -1382,13 +1437,13 @@ export default function VynzoraFloatingAssistant() {
 
     return () => {
       mounted = false;
-      stopWakeWordListening();
+      stopWakeWordListeningRef.current?.();
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;
       }
     };
-  }, [startWakeWordListening, stopWakeWordListening]);
+  }, []);
 
   // Request microphone permission on manual user click if initially blocked
   const requestMicPermissionManually = async () => {
